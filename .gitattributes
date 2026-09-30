@@ -1,0 +1,10 @@
+# Build context and committed blobs must be byte-identical. Docker COPYs the
+# working tree, so a CRLF checkout of an LF blob would make the image differ
+# from the commit it was built from.
+* text=auto eol=lf
+*.py text eol=lf
+*.md text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+.gitignore text eol=lf
+requirements.txt text eol=lf
