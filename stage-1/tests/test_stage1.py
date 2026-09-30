@@ -8,6 +8,7 @@ Runs the FastAPI app through ``TestClient`` - no server, no Docker, no network.
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import threading
@@ -824,25 +825,32 @@ def test_no_nested_lock_acquisition_in_app_package():
 
 
 def test_public_projection_helpers_take_no_lock():
-    """``_user_public`` exists precisely to be callable while the lock is held.
+    """``_user_public`` is the single projection and is lock-free by contract.
 
-    Assert that invariant directly so renaming or reintroducing a lock inside it
-    is caught even if the AST walk above is refuted by a refactor.
+    The lock-taking ``user_public`` twin was deleted precisely because an unused
+    lock-taking helper is an invitation to reintroduce the P0 self-deadlock.
+    This asserts both halves: the surviving projection takes no lock, and the
+    trap is still gone.
     """
-    import ast
-
     path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "dependencies.py")
     with open(path, "rb") as fh:
         tree = ast.parse(fh.read(), filename=path)
 
     found = False
     for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef) or node.name != "_user_public":
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        if node.name == "user_public":
+            pytest.fail(
+                "app/dependencies.py defines a lock-taking user_public(); it is a trap "
+                "- call it inside a work() and the authenticated surface deadlocks"
+            )
+        if node.name != "_user_public":
             continue
         found = True
         for sub in ast.walk(node):
             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
-                assert sub.func.attr not in {"read", "transaction"}, (
+                assert sub.func.attr not in LOCK_TAKERS, (
                     f"_user_public() must be lock-free but calls .{sub.func.attr}() "
                     f"at line {sub.lineno}"
                 )

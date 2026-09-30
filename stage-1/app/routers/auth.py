@@ -83,7 +83,7 @@ def signup(body: SignupIn) -> JSONResponse:
         # not change the sum, and I2 true because 0 is not negative.
         store.balances.setdefault(handle, 0)
         store._check_invariants()
-        # _user_public, not user_public: the lock is already held here.
+        # _user_public, not a lock-taking projection: the lock is already held.
         public = _user_public(store.users[handle], store.balances)
         return {"status": "ok", "handle": handle, "user": public, **public}
 

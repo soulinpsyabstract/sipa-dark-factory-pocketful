@@ -74,11 +74,21 @@ def require_operator(handle: str) -> dict:
 
 
 def _user_public(user: dict, balances: dict[str, int]) -> dict[str, Any]:
-    """Lock-free projection of a user.
+    """The single public projection of a user. **Lock-free by contract.**
 
-    ``threading.Lock`` is NOT reentrant, so this must never take the lock:
-    it is called both from inside ``store.transaction(...)`` and, via
-    ``user_public``, from read-only paths.
+    ``threading.Lock`` is NOT reentrant, so this function must never take the
+    lock. Handlers call it both from inside ``store.transaction(...)`` (where
+    the lock is already held) and from read-only paths, so there is only one
+    projection and it is deliberately the lock-free one.
+
+    This is the ONLY user projection in the codebase. A lock-taking sibling was
+    deliberately deleted: it had no call sites, and shipping an unused
+    lock-taking helper next to the lock-free one is precisely the shape that
+    invites the next self-deadlock - someone calls it from inside a ``work()``
+    and the whole authenticated surface hangs again.
+
+    ``tests/test_stage1.py::test_public_projection_helpers_take_no_lock`` and
+    ``test_no_nested_lock_acquisition_in_app_package`` enforce this statically.
     """
     return {
         "handle": user["handle"],
@@ -88,8 +98,3 @@ def _user_public(user: dict, balances: dict[str, int]) -> dict[str, Any]:
         "balance": balances.get(user["handle"], 0),
         "created_at": user.get("created_at") or "",
     }
-
-
-def user_public(user: dict) -> dict[str, Any]:
-    """Public projection, taking the lock. Never call while holding it."""
-    return store.read(lambda: _user_public(user, store.balances))
