@@ -20,6 +20,7 @@ I4  every stored password is a bcrypt hash (never plaintext)
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import threading
 from datetime import datetime, timezone
@@ -187,8 +188,6 @@ class Store:
         if not isinstance(raw_balances, dict):
             raise validation_error("fixture 'balances' must be an object of handle -> integer")
 
-        from .security import hash_password  # local import: avoids a cycle
-
         users: dict[str, dict[str, Any]] = {}
         balances: dict[str, int] = {}
 
@@ -211,18 +210,27 @@ class Store:
             if raw_balance < 0:
                 raise validation_error(f"balance for {handle!r} must not be negative")
 
-            password = entry.get("password")
-            if password is None:
-                password = DEFAULT_FIXTURE_PASSWORD
-            if not isinstance(password, str) or not password:
-                raise validation_error(f"password for {handle!r} must be a non-empty string")
+            # A payload produced by /_test/export already carries a bcrypt
+            # digest, so it is restored verbatim; only a fixture that supplies
+            # a plaintext `password` is hashed here. This is what makes
+            # export -> import -> login a true round trip.
+            existing_hash = entry.get("password_hash")
+            if is_bcrypt_hash(existing_hash):
+                password_hash = existing_hash
+            else:
+                password = entry.get("password")
+                if password is None:
+                    password = DEFAULT_FIXTURE_PASSWORD
+                if not isinstance(password, str) or not password:
+                    raise validation_error(f"password for {handle!r} must be a non-empty string")
+                password_hash = _fixture_password_hash(password)
 
             email = entry.get("email") or f"{handle}@pocketful.test"
             users[handle] = {
                 "handle": handle,
                 "email": str(email).strip().lower(),
                 "display_name": str(entry.get("display_name") or handle),
-                "password_hash": hash_password(password),
+                "password_hash": password_hash,
                 "is_operator": bool(entry.get("is_operator", False)),
                 "created_at": entry.get("created_at") or now_iso(),
             }
@@ -462,6 +470,27 @@ class Store:
 
 DEFAULT_FIXTURE_PASSWORD = "pocketful-fixture-pw"
 
+# bcrypt is deliberately slow. Every /_test/reset re-hashes every seeded
+# user, and the concurrency suites reset in a loop, so digests are memoised.
+# The memo is keyed by a SHA-256 of the password, never by the password
+# itself, and holds only bcrypt digests - no plaintext is retained, and this
+# dict is never read by the store or by /_test/export.
+_FIXTURE_HASH_MEMO: dict[str, str] = {}
+_FIXTURE_HASH_MEMO_MAX = 512
+
+
+def _fixture_password_hash(password: str) -> str:
+    from .security import hash_password
+
+    memo_key = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    digest = _FIXTURE_HASH_MEMO.get(memo_key)
+    if digest is None:
+        digest = hash_password(password)
+        if len(_FIXTURE_HASH_MEMO) >= _FIXTURE_HASH_MEMO_MAX:
+            _FIXTURE_HASH_MEMO.clear()
+        _FIXTURE_HASH_MEMO[memo_key] = digest
+    return digest
+
 
 def is_valid_handle(handle: Any) -> bool:
     import re
@@ -473,11 +502,18 @@ def derive_handle(email: str) -> str:
     """Derive a candidate handle from an email address.
 
     Lower-cases the local part and drops every character outside
-    ``[a-z0-9_]``; the result is then validated against ``^[a-z0-9_]{1,20}$``.
-    A local part that sanitises down to nothing (e.g. ``"!!!@x.com"``) fails
-    that regex and the signup is rejected with 422.
+    ``[a-z0-9_]``. The result is then validated against
+    ``^[a-z0-9_]{1,20}$`` **without truncation**, so the regex is genuinely
+    enforced on the derived value rather than on a shortened copy of it.
+
+    Consequences, both covered by tests and documented in CONTRACT.md:
+
+    * a local part that sanitises down to nothing (``"!!!@x.com"``) fails the
+      regex and signup is rejected 422;
+    * a local part longer than 20 characters fails the regex and signup is
+      rejected 422, rather than being silently cut down to 20.
     """
     import re
 
     local = email.strip().split("@", 1)[0].lower()
-    return re.sub(r"[^a-z0-9_]", "", local)[:20]
+    return re.sub(r"[^a-z0-9_]", "", local)

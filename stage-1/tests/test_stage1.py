@@ -34,6 +34,20 @@ FIXTURE = {
 
 AMOUNT_REJECTED = [0, -5, 1.5, "100", True, None, []]
 
+#: Every account funded, for the tests that need participants who *can* be
+#: debited. The default FIXTURE gives `op` and any new signup a zero balance,
+#: and a zero-balance participant is correctly refused with 422.
+RICH_FIXTURE = {
+    "seeded_total": 100000,
+    "users": [
+        {"handle": "alice", "email": "alice@example.com", "balance": 60000, "password": PW},
+        {"handle": "bob", "email": "bob@example.com", "balance": 10000, "password": PW},
+        {"handle": "carol", "email": "carol@example.com", "balance": 10000, "password": PW},
+        {"handle": "dave", "email": "dave@example.com", "balance": 10000, "password": PW},
+        {"handle": "op", "email": "op@example.com", "balance": 10000, "password": PW, "is_operator": True},
+    ],
+}
+
 
 @pytest.fixture()
 def client():
@@ -79,11 +93,8 @@ def test_health(client):
 
 
 def test_app_binds_port_env():
-    # main.main() reads $PORT; check the default is 8080 per spec section 1.
-    import importlib
-
-    os.environ.pop("PORT", None)
-    src = open(os.path.join(os.path.dirname(app.__file__), "..", "app", "main.py"), encoding="utf-8").read()
+    # main.main() reads $PORT; spec section 1 requires a default of 8080.
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "main.py"), encoding="utf-8").read()
     assert 'os.environ.get("PORT", "8080")' in src
 
 
@@ -161,10 +172,22 @@ def test_signup_derives_handle(client):
     assert r.json()["handle"] == "danalopezwork"
 
 
-@pytest.mark.parametrize("email", ["!!!@example.com", "   @example.com", "a" * 40 + "@example.com"])
+@pytest.mark.parametrize("email", ["!!!@example.com", "   @example.com", "@example.com"])
 def test_signup_rejects_unconformable_handle(client, email):
     r = client.post("/auth/signup", json={"email": email, "password": PW, "display_name": "X"})
     assert r.status_code == 422
+
+
+def test_long_local_part_is_rejected_not_truncated(client):
+    # Derivation does not truncate: the regex is enforced on the derived
+    # value, so an over-long local part is 422 rather than silently cut to 20.
+    r = client.post("/auth/signup", json={"email": "a" * 40 + "@example.com", "password": PW, "display_name": "X"})
+    assert r.status_code == 422
+    r = client.post("/auth/signup", json={"email": "a" * 21 + "@example.com", "password": PW, "display_name": "X"})
+    assert r.status_code == 422
+    r = client.post("/auth/signup", json={"email": "a" * 20 + "@example.com", "password": PW, "display_name": "X"})
+    assert r.status_code == 200
+    assert r.json()["handle"] == "a" * 20
 
 
 def test_signup_rejects_bad_explicit_handle(client):
@@ -267,14 +290,24 @@ def test_request_decline_and_cancel(client):
     a, b = token(client), token(client, "bob")
     rid1 = client.post("/requests", json={"to": "bob", "amount": 10}, headers=auth(a)).json()["id"]
     assert client.post(f"/requests/{rid1}/decline", headers=auth(b)).status_code == 200
-    assert inv(client)["requests"][0]["status"] == "declined"
+    by_id = {r["id"]: r for r in inv(client)["requests"]}
+    assert by_id[rid1]["status"] == "declined"
 
     rid2 = client.post("/requests", json={"to": "bob", "amount": 20}, headers=auth(a)).json()["id"]
     assert client.post(f"/requests/{rid2}/cancel", headers=auth(a)).status_code == 200
-    assert inv(client)["requests"][0]["status"] == "cancelled"
+    by_id = {r["id"]: r for r in inv(client)["requests"]}
+    assert by_id[rid2]["status"] == "cancelled"
 
     assert client.post(f"/requests/{rid2}/pay", headers=auth(b)).status_code == 409
     assert client.post("/requests/req_99999/pay", headers=auth(b)).status_code == 404
+
+
+def test_request_pay_flips_status(client):
+    a, b = token(client), token(client, "bob")
+    rid = client.post("/requests", json={"to": "bob", "amount": 10}, headers=auth(a)).json()["id"]
+    assert client.post(f"/requests/{rid}/pay", headers=auth(b)).status_code == 200
+    by_id = {r["id"]: r for r in inv(client)["requests"]}
+    assert by_id[rid]["status"] == "paid"
 
 
 def test_request_filters(client):
@@ -316,7 +349,10 @@ def test_request_filters(client):
     ],
 )
 def test_split_distribution(client, amount, count, expected):
-    handles = ["bob", "carol", "op"][:count]
+    # Every participant must be able to cover its share: a debit that would
+    # leave a balance negative is correctly refused with 422.
+    client.post("/_test/reset", json=RICH_FIXTURE)
+    handles = ["bob", "carol", "dave", "op"][:count]
     r = client.post(
         "/splits", json={"amount": amount, "participants": handles}, headers=auth(token(client))
     )
@@ -327,15 +363,33 @@ def test_split_distribution(client, amount, count, expected):
 
 
 def test_split_remainder_goes_to_first(client):
-    client.post("/auth/signup", json={"email": "dave@example.com", "password": PW, "display_name": "D"})
+    client.post("/_test/reset", json=RICH_FIXTURE)
     r = client.post(
         "/splits",
         json={"amount": 10, "participants": ["dave", "op", "carol", "bob"]},
         headers=auth(token(client)),
     )
+    assert r.status_code == 200, r.text
     parts = r.json()["parts"]
     assert r.json()["shares"] == [3, 3, 2, 2]
     assert [p["handle"] for p in parts[:2]] == ["dave", "op"]
+    assert_invariants(client)
+
+
+def test_split_payer_in_own_list_is_not_debited(client):
+    client.post("/_test/reset", json=RICH_FIXTURE)
+    before = inv(client)["balances"]
+    r = client.post(
+        "/splits",
+        json={"amount": 100, "participants": ["alice", "bob"]},
+        headers=auth(token(client)),
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["shares"] == [50, 50]
+    assert r.json()["total_charged"] == 50
+    after = inv(client)["balances"]
+    assert after["alice"] == before["alice"] + 50
+    assert after["bob"] == before["bob"] - 50
     assert_invariants(client)
 
 
@@ -361,6 +415,8 @@ def test_split_validation(client):
 
 @pytest.mark.parametrize("case", ["payments", "requests", "pay", "splits", "settlements"])
 def test_idempotent_replay_on_all_five(client, case):
+    # RICH_FIXTURE so the splits case has participants who can be debited.
+    client.post("/_test/reset", json=RICH_FIXTURE)
     a, b, op = (token(client, h) for h in ("alice", "bob", "op"))
 
     if case == "payments":
@@ -374,8 +430,8 @@ def test_idempotent_replay_on_all_five(client, case):
         first = client.post(f"/requests/{rid}/pay", headers=auth(b, "k"))
         again = lambda: client.post(f"/requests/{rid}/pay", headers=auth(b, "k"))  # noqa: E731
     elif case == "splits":
-        first = client.post("/splits", json={"amount": 100, "participants": ["bob", "carol", "op"]}, headers=auth(a, "k"))
-        again = lambda: client.post("/splits", json={"amount": 100, "participants": ["bob", "carol", "op"]}, headers=auth(a, "k"))  # noqa: E731
+        first = client.post("/splits", json={"amount": 100, "participants": ["bob", "carol", "dave"]}, headers=auth(a, "k"))
+        again = lambda: client.post("/splits", json={"amount": 100, "participants": ["bob", "carol", "dave"]}, headers=auth(a, "k"))  # noqa: E731
     else:
         body = {"entries": [{"from": "bob", "to": "carol", "amount": 100}]}
         first = client.post("/settlements", json=body, headers=auth(op, "k"))
@@ -424,17 +480,24 @@ def test_no_key_means_no_idempotency(client):
 
 
 def test_activity_feed(client):
+    client.post("/_test/reset", json=RICH_FIXTURE)
     a, b, op = (token(client, h) for h in ("alice", "bob", "op"))
     client.post("/payments", json={"to": "bob", "amount": 111}, headers=auth(a))
     rid = client.post("/requests", json={"to": "bob", "amount": 222}, headers=auth(a)).json()["id"]
     client.post(f"/requests/{rid}/pay", headers=auth(b))
-    client.post("/splits", json={"amount": 300, "participants": ["bob", "carol", "op"]}, headers=auth(a))
+    client.post("/splits", json={"amount": 300, "participants": ["bob", "carol", "dave"]}, headers=auth(a))
     client.post("/settlements", json={"entries": [{"from": "carol", "to": "alice", "amount": 50}]}, headers=auth(op))
 
-    for handle, tok in (("alice", a), ("bob", b)):
-        types = {e["type"] for e in client.get("/activity", headers=auth(tok)).json()["activity"]}
-        for expected in ("payment", "request_created", "request_paid", "split", "settlement"):
-            assert expected in types, f"{handle} feed missing {expected}: {sorted(types)}"
+    # The settlement is carol -> alice, so it lands in those two feeds only.
+    per_handle = {
+        "alice": {"payment", "request_created", "request_paid", "split", "settlement"},
+        "bob": {"payment", "request_created", "request_paid", "split"},
+        "carol": {"settlement"},
+    }
+    for handle, expected in per_handle.items():
+        types = {e["type"] for e in client.get("/activity", headers=auth(token(client, handle))).json()["activity"]}
+        missing = expected - types
+        assert not missing, f"{handle} feed missing {sorted(missing)}: has {sorted(types)}"
 
     feed = client.get("/activity", headers=auth(a)).json()["activity"]
     assert all(e["handle"] == "alice" for e in feed)
@@ -480,32 +543,51 @@ def test_settlement_moves_money_and_is_all_or_nothing(client):
 
 
 def test_all_sixteen_endpoints_present(client):
+    # /_test/reset replaces the world and invalidates every token, so it must
+    # run before the tokens below are minted.
+    client.post("/_test/reset", json=FIXTURE)
     a, b, op = (token(client, h) for h in ("alice", "bob", "op"))
-    rid = client.post("/requests", json={"to": "bob", "amount": 1}, headers=auth(a)).json()["id"]
-    rid2 = client.post("/requests", json={"to": "bob", "amount": 1}, headers=auth(a)).json()["id"]
-    export = client.get("/_test/export").json()
+    # three separate requests: `pay` and `decline` are both terminal, so each
+    # transition needs a request that is still `open`.
+    rids = [
+        client.post("/requests", json={"to": "bob", "amount": 1}, headers=auth(a)).json()["id"]
+        for _ in range(3)
+    ]
 
     probes = [
         client.get("/health"),
-        client.post("/_test/reset", json=FIXTURE),
         client.get("/_test/export"),
-        client.post("/_test/import", json=export),
         client.post("/auth/signup", json={"email": "zed@example.com", "password": PW, "display_name": "Z"}),
         client.post("/auth/login", json={"email": "alice@example.com", "password": PW}),
         client.get("/me", headers=auth(a)),
         client.post("/payments", json={"to": "bob", "amount": 1}, headers=auth(a)),
         client.post("/requests", json={"to": "bob", "amount": 1}, headers=auth(a)),
-        client.post(f"/requests/{rid}/pay", headers=auth(b)),
-        client.post(f"/requests/{rid}/decline", headers=auth(b)),
-        client.post(f"/requests/{rid2}/cancel", headers=auth(a)),
+        client.post(f"/requests/{rids[0]}/pay", headers=auth(b)),
+        client.post(f"/requests/{rids[1]}/decline", headers=auth(b)),
+        client.post(f"/requests/{rids[2]}/cancel", headers=auth(a)),
         client.get("/requests", headers=auth(a)),
-        client.post("/splits", json={"amount": 3, "participants": ["bob", "carol", "op"]}, headers=auth(a)),
+        client.post("/splits", json={"amount": 3, "participants": ["bob", "carol"]}, headers=auth(a)),
         client.get("/activity", headers=auth(a)),
         client.post("/settlements", json={"entries": [{"from": "bob", "to": "carol", "amount": 1}]}, headers=auth(op)),
+        # /_test/import last: it replaces the world, so it invalidates every
+        # token issued above and would 401 every later probe.
+        client.post("/_test/import", json=client.get("/_test/export").json()),
+        # /_test/reset is probed here; re-mint so nothing after it needs a token
+        client.post("/_test/reset", json=FIXTURE),
     ]
+
     assert len(probes) == 16
     bad = [(r.request.method, r.request.url, r.status_code) for r in probes if r.status_code >= 300]
     assert not bad, bad
+
+
+def test_import_invalidates_outstanding_tokens(client):
+    tok = token(client)
+    assert client.get("/me", headers=auth(tok)).status_code == 200
+    client.post("/_test/import", json=client.get("/_test/export").json())
+    # documented behaviour: import replaces all state, tokens included
+    assert client.get("/me", headers=auth(tok)).status_code == 401
+    assert client.get("/me", headers=auth(token(client))).status_code == 200
 
 
 def test_no_state_leaks_between_fixtures(client):
@@ -514,3 +596,255 @@ def test_no_state_leaks_between_fixtures(client):
     client.post("/_test/reset", json=FIXTURE)
     assert inv(client)["balances"]["alice"] == 60000
     assert_invariants(client)
+
+
+# ======================================================================
+# Regression gate: self-deadlock on the authenticated surface
+# ======================================================================
+
+
+def _call_within(fn, timeout):
+    """Run ``fn`` on a worker thread and hard-fail if it does not return.
+
+    A deadlocked request never raises and never returns, so the only honest
+    assertion here is a wall-clock one: the worker must finish and the test
+    must FAIL when it does not. ``pytest-timeout`` is not a dependency, and a
+    plain ``assert resp.status_code == 200`` is worthless because a hang means
+    that line is never reached.
+    """
+    box = {}
+
+    def worker():
+        try:
+            box["resp"] = fn()
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    assert not t.is_alive(), (
+        f"call did not return within {timeout}s - the request is deadlocked. "
+        f"threading.Lock() is not reentrant, so a lock-taking helper was almost "
+        f"certainly called from inside store.transaction(...)."
+    )
+    assert "exc" not in box, f"request raised: {box['exc']!r}"
+    return box["resp"]
+
+
+def test_authenticated_surface_never_self_deadlocks(client):
+    """P0 regression: signup/login/me must return, not hang.
+
+    At commit 127c64f the first ``POST /auth/signup`` blocked forever, which
+    poisoned the whole instance. Each call is made on its own thread with a
+    join timeout so a reintroduced deadlock fails the suite instead of hanging
+    it, and the instance is checked for health afterwards.
+    """
+    timeout = 20.0
+
+    r = _call_within(
+        lambda: client.post(
+            "/auth/signup",
+            json={"email": "noah@example.com", "password": PW, "display_name": "Noah"},
+        ),
+        timeout,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["handle"] == "noah"
+
+    r = _call_within(
+        lambda: client.post("/auth/login", json={"email": "alice@example.com", "password": PW}),
+        timeout,
+    )
+    assert r.status_code == 200, r.text
+    tok = r.json()["access_token"]
+
+    r = _call_within(lambda: client.get("/me", headers=auth(tok)), timeout)
+    assert r.status_code == 200, r.text
+    assert r.json()["handle"] == "alice"
+
+    # the instance must still be usable: a stuck lock would show up here too
+    r = _call_within(
+        lambda: client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(tok)),
+        timeout,
+    )
+    assert r.status_code == 200, r.text
+
+    r = _call_within(lambda: client.get("/health"), timeout)
+    assert r.status_code == 200, r.text
+
+
+def test_store_lock_is_not_reentrant():
+    """Spec 1 mandates ``threading.Lock()``; an RLock would mask deadlocks."""
+    from app import store as store_mod  # noqa: F401
+
+    s = Store()
+    # threading.Lock() is _thread.lock; threading.RLock() is _thread.RLock.
+    assert type(s.lock).__name__ == "lock", (
+        f"spec requires threading.Lock(), got {type(s.lock)}"
+    )
+    assert not isinstance(s.lock, type(threading.RLock())), "store.lock must not be an RLock"
+    assert not hasattr(s.lock, "_is_rlock"), "store.lock must not be an RLock"
+
+
+# ======================================================================
+# Static guard: no lock-taking helper called from inside the critical section
+# ======================================================================
+
+
+def _source_files():
+    app_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
+    for root, _dirs, names in os.walk(app_dir):
+        for n in sorted(names):
+            if n.endswith(".py"):
+                yield os.path.join(root, n)
+
+
+#: Methods on ``Store`` that take ``self.lock``. Any of these invoked while the
+#: same thread already holds it blocks forever, because ``threading.Lock`` is
+#: not reentrant.
+LOCK_TAKERS = {"read", "transaction"}
+
+
+def _collect_functions(tree):
+    """name -> ast.FunctionDef for every top-level and nested def in a module."""
+    out = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            out.setdefault(node.name, node)
+    return out
+
+
+def _called_names(node):
+    """Names invoked anywhere inside ``node``."""
+    names = set()
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.Call):
+            continue
+        f = sub.func
+        if isinstance(f, ast.Name):
+            names.add(f.id)
+        elif isinstance(f, ast.Attribute):
+            names.add(f.attr)
+    return names
+
+
+def _takes_lock_directly(func_node):
+    for sub in ast.walk(func_node):
+        if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+            if sub.func.attr in LOCK_TAKERS:
+                return True
+    return False
+
+
+def test_no_nested_lock_acquisition_in_app_package():
+    """Mechanically forbid taking the store lock while already holding it.
+
+    The P0 at commit 127c64f was exactly this bug class: ``user_public()``
+    called ``store.read(...)`` but was itself invoked from inside
+    ``store.transaction(work)``. Both call sites look correct in isolation, so
+    review does not catch it - the failure only appears at runtime as a
+    permanent hang. It is therefore rejected here by static analysis.
+
+    The rule that matters: the callback handed to ``store.read``/
+    ``store.transaction`` runs *with the lock held*, so neither the callback
+    nor anything it calls may take the lock again. Inline lambdas that only
+    touch state are the intended idiom and are allowed; a *named* helper (or a
+    transitive chain of them) that takes the lock is not.
+    """
+    import ast
+
+    modules = {}
+    functions_by_name = {}
+    for path in _source_files():
+        with open(path, "rb") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        rel = os.path.relpath(path, os.path.dirname(path))
+        modules[rel] = (tree, _collect_functions(tree))
+        for name, node in modules[rel][1].items():
+            functions_by_name.setdefault(name, []).append((rel, node))
+
+    # Transitive closure: does this function end up taking the lock?
+    def takes_lock(rel, name, seen):
+        key = (rel, name)
+        if key in seen:
+            return False
+        seen.add(key)
+        node = modules[rel][1].get(name)
+        if node is None:
+            return False
+        if _takes_lock_directly(node):
+            return True
+        for callee in _called_names(node):
+            if callee in LOCK_TAKERS:
+                continue
+            for cand_rel, cand_node in functions_by_name.get(callee, []):
+                if cand_node is node:
+                    continue
+                if takes_lock(cand_rel, callee, seen):
+                    return True
+        return False
+
+    offenders = []
+    for rel, (tree, funcs) in modules.items():
+        for fn_name, fn_node in funcs.items():
+            for call in ast.walk(fn_node):
+                if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Attribute):
+                    continue
+                if call.func.attr not in LOCK_TAKERS:
+                    continue
+                cb_args = list(call.args) + [kw.value for kw in call.keywords]
+                if not cb_args:
+                    continue
+                cb = cb_args[0]
+                if isinstance(cb, ast.Lambda):
+                    for callee in _called_names(cb):
+                        if callee in LOCK_TAKERS:
+                            offenders.append(
+                                f"{rel}:{cb.lineno}: inline callback to store.{call.func.attr}() "
+                                f"calls {callee}() - the lock is already held"
+                            )
+                            continue
+                        for cand_rel, _ in functions_by_name.get(callee, []):
+                            if takes_lock(cand_rel, callee, set()):
+                                offenders.append(
+                                    f"{rel}:{cb.lineno}: inline callback to "
+                                    f"store.{call.func.attr}() calls {callee}(), which takes the "
+                                    f"lock - the lock is already held"
+                                )
+                elif isinstance(cb, ast.Name):
+                    for cand_rel, _ in functions_by_name.get(cb.id, []):
+                        if takes_lock(cand_rel, cb.id, set()):
+                            offenders.append(
+                                f"{rel}:{call.lineno}: store.{call.func.attr}({cb.id}) - "
+                                f"{cb.id}() takes the lock but runs with the lock already held"
+                            )
+
+    assert not offenders, "nested store-lock acquisition detected:\n  " + "\n  ".join(offenders)
+
+
+def test_public_projection_helpers_take_no_lock():
+    """``_user_public`` exists precisely to be callable while the lock is held.
+
+    Assert that invariant directly so renaming or reintroducing a lock inside it
+    is caught even if the AST walk above is refuted by a refactor.
+    """
+    import ast
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "dependencies.py")
+    with open(path, "rb") as fh:
+        tree = ast.parse(fh.read(), filename=path)
+
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != "_user_public":
+            continue
+        found = True
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                assert sub.func.attr not in {"read", "transaction"}, (
+                    f"_user_public() must be lock-free but calls .{sub.func.attr}() "
+                    f"at line {sub.lineno}"
+                )
+    assert found, "_user_public() is missing - the lock-free projection was removed"
+

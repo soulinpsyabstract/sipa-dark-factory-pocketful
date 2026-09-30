@@ -14,7 +14,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 
-from ..dependencies import get_current_user, require_operator, store, user_public
+from ..dependencies import get_current_user, require_operator, store
 from ..errors import AppError, conflict, forbidden, not_found, validation_error
 from ..schemas import PaymentIn, RequestIn, SettlementIn, SplitIn
 from ..store import REQUEST_STATUSES, is_valid_handle, now_iso

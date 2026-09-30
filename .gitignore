@@ -3,3 +3,4 @@ worker.py
 __pycache__/
 *.pyc
 stage-1/.venv/
+*.log

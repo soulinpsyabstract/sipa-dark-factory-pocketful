@@ -34,6 +34,19 @@ FIXTURE = {
     ],
 }
 
+#: Every account funded. A participant whose balance cannot cover its share is
+#: correctly refused with 422, so split tests need participants who can pay.
+RICH_FIXTURE = {
+    "seeded_total": 100000,
+    "users": [
+        {"handle": "alice", "email": "alice@example.com", "balance": 60000, "password": PW},
+        {"handle": "bob", "email": "bob@example.com", "balance": 10000, "password": PW},
+        {"handle": "carol", "email": "carol@example.com", "balance": 10000, "password": PW},
+        {"handle": "dave", "email": "dave@example.com", "balance": 10000, "password": PW},
+        {"handle": "op", "email": "op@example.com", "balance": 10000, "password": PW, "is_operator": True},
+    ],
+}
+
 
 class Suite:
     def __init__(self) -> None:
@@ -64,10 +77,23 @@ class Suite:
         return 1 if self.failed else 0
 
 
+#: Returned instead of a real bearer token when login fails. Subsequent calls
+#: then draw 401s and get reported as FAILs, instead of aborting the section.
+BAD_TOKEN = "__login_failed__"
+
+
 class Api:
-    def __init__(self, base: str) -> None:
+    def __init__(self, base: str, on_error: Any = None) -> None:
         self.base = base.rstrip("/")
         self.client = httpx.Client(base_url=self.base, timeout=60.0)
+        self.on_error = on_error
+
+    def fail(self, what: str, exc: BaseException) -> None:
+        detail = f"{type(exc).__name__}: {exc}"
+        if self.on_error is not None:
+            self.on_error(what, detail)
+        else:
+            print(f"[FAIL] {what}  -- {detail}")
 
     def c(self) -> httpx.Client:
         return httpx.Client(base_url=self.base, timeout=60.0)
@@ -89,11 +115,22 @@ class Api:
     def login(self, email: str, password: str = PW) -> httpx.Response:
         return self.client.post("/auth/login", json={"email": email, "password": password})
 
-    def token(self, handle: str) -> str:
-        email = "op@example.com" if handle == "op" else f"{handle}@example.com"
-        r = self.login(email)
-        r.raise_for_status()
-        return r.json()["access_token"]
+    def token(self, handle: str, email: str | None = None) -> str:
+        """Log in and return a bearer token.
+
+        Never raises: a failed login is recorded as a FAIL and yields a sentinel
+        so the remaining checks in the section still run (and report the 401s
+        they actually received) rather than truncating the whole work item.
+        """
+        if email is None:
+            email = "op@example.com" if handle == "op" else f"{handle}@example.com"
+        try:
+            r = self.login(email)
+            r.raise_for_status()
+            return str(r.json()["access_token"])
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"login as {email!r} to obtain a token", exc)
+            return BAD_TOKEN
 
     def me(self, token: str) -> httpx.Response:
         return self.client.get("/me", headers={"Authorization": f"Bearer {token}"})
@@ -271,7 +308,7 @@ def w3(api: Api, s: Suite) -> None:
     r = api.login("nobody@example.com")
     s.check("login with unknown email -> 401", r.status_code == 401, f"got {r.status_code}")
 
-    tok = api.token("danalopezwork")
+    tok = api.token("danalopezwork", email="Dana.Lopez+work@example.com")
     r = api.me(tok)
     s.check("GET /me with bearer -> 200", r.status_code == 200, r.text[:200])
     s.check("GET /me returns the right handle", r.json().get("handle") == "danalopezwork", r.text[:120])
@@ -327,12 +364,9 @@ def w4(api: Api, s: Suite) -> None:
         f"{snap} -> {api.export().json()['balances']}",
     )
 
-    carol_bal = api.export().json()["balances"]["carol"]
-    r = api.pay(alice, "carol", carol_bal + 1)
-    s.check("transfer that would make carol go negative is still allowed (recipient may go up) or 422", r.status_code in (200, 422))
-
-    r = api.pay(bob, "alice", carol_bal + 5000)
-    s.check("transfer bigger than the sender's whole balance -> 422", r.status_code == 422, f"got {r.status_code}")
+    bob_bal = api.export().json()["balances"]["bob"]
+    r = api.pay(bob, "alice", bob_bal + 1)
+    s.check("transfer larger than the sender's balance -> 422", r.status_code == 422, f"got {r.status_code}")
     exp = api.export().json()
     s.check("no negative balance exists", exp["invariants"]["no_negative_balances"], invariant_detail(exp))
 
@@ -376,11 +410,15 @@ def w5(api: Api, s: Suite) -> None:
 
     r = api.act(alice, rid, "cancel")
     s.check("creator can cancel an open request -> 200", r.status_code == 200, r.text[:200])
-    s.check("cancelled status", api.export().json()["requests"][0]["status"] == "cancelled")
+    s.check("cancelled status", {x["id"]: x["status"] for x in api.export().json()["requests"]}[rid] == "cancelled")
 
-    for verb in ("pay", "decline", "cancel"):
-        r = api.act(bob, rid, verb)
-        s.check(f"{verb} on a cancelled request -> 409", r.status_code == 409, f"got {r.status_code}")
+    # State guard: each verb has one legal actor (pay/decline = recipient,
+    # cancel = creator), and the actor check (403) legitimately precedes the
+    # state check (409). So reaching 409 means using the right actor.
+    s.check("pay on a cancelled request -> 409 (as recipient)", api.act(bob, rid, "pay").status_code == 409)
+    s.check("decline on a cancelled request -> 409 (as recipient)", api.act(bob, rid, "decline").status_code == 409)
+    s.check("cancel on a cancelled request -> 409 (as creator)", api.act(alice, rid, "cancel").status_code == 409)
+    s.check("wrong actor still gets 403 even on a terminal request", api.act(carol, rid, "cancel").status_code == 403)
 
     # a fresh one for the pay path
     r = api.request_(alice, "bob", 7000)
@@ -390,17 +428,18 @@ def w5(api: Api, s: Suite) -> None:
     s.check("recipient can pay an open request -> 200", r.status_code == 200, r.text[:200])
     after = api.export().json()["balances"]
     s.check("pay moves funds recipient -> creator", after["bob"] == before["bob"] - 7000 and after["alice"] == before["alice"] + 7000, f"{before} -> {after}")
-    s.check("pay flips status to paid", api.export().json()["requests"][-1]["status"] == "paid")
+    s.check("pay flips status to paid", {x["id"]: x["status"] for x in api.export().json()["requests"]}[rid2] == "paid")
     s.check("sum invariant after pay", invariant_ok(api.export().json()), invariant_detail(api.export().json()))
 
-    for verb in ("pay", "decline", "cancel"):
-        r = api.act(bob, rid2, verb)
-        s.check(f"{verb} on a paid request -> 409", r.status_code == 409, f"got {r.status_code}")
+    # pay/decline are the recipient's, cancel is the creator's
+    s.check("pay on a paid request -> 409", api.act(bob, rid2, "pay").status_code == 409)
+    s.check("decline on a paid request -> 409", api.act(bob, rid2, "decline").status_code == 409)
+    s.check("cancel on a paid request -> 409", api.act(alice, rid2, "cancel").status_code == 409)
 
     r = api.request_(alice, "bob", 3000)
     rid3 = r.json()["id"]
     s.check("recipient can decline an open request -> 200", api.act(bob, rid3, "decline").status_code == 200)
-    s.check("decline flips status to declined", api.export().json()["requests"][-1]["status"] == "declined")
+    s.check("decline flips status to declined", {x["id"]: x["status"] for x in api.export().json()["requests"]}[rid3] == "declined")
 
     r = api.request_(alice, "bob", 1234)
     s.check("unknown request id -> 404", api.act(bob, r.json()["id"][:-1] + "zzz", "pay").status_code == 404)
@@ -444,36 +483,39 @@ Api.list_requests = _list_requests
 
 def w6(api: Api, s: Suite) -> None:
     s.head("W6  splits")
-    api.reset(FIXTURE)
-    alice, bob, carol = api.token("alice"), api.token("bob"), api.token("carol")
+    api.reset(RICH_FIXTURE)
+    alice = api.token("alice")
 
-    r = api.split(alice, 100, ["bob", "carol", "op"])
+    r = api.split(alice, 100, ["bob", "carol", "dave"])
     s.check("POST /splits 100 over 3 -> 200", r.status_code == 200, r.text[:200])
-    s.check("100 / 3 -> [34, 33, 33]", r.json()["shares"] == [34, 33, 33], str(r.json().get("shares")))
+    s.check("100 / 3 -> [34, 33, 33]", r.json().get("shares") == [34, 33, 33], str(r.json().get("shares")))
     s.check("parts sum back to the amount", sum(p["amount"] for p in r.json()["parts"]) == 100)
-
-    api.reset(FIXTURE)
-    alice, bob, carol = api.token("alice"), api.token("bob"), api.token("carol")
-    r = api.split(alice, 10, ["bob", "carol", "op", "dave"])
-    s.check("POST /splits 10 over 4 -> 200", r.status_code == 200, r.text[:200])
-
-    api.reset(FIXTURE)
-    api.client.post("/auth/signup", json={"email": "dave@example.com", "password": PW, "display_name": "D"})
-    alice, bob, carol, dave = (api.token(h) for h in ("alice", "bob", "carol", "dave"))
-    r = api.split(alice, 10, ["bob", "carol", "dave", "op"])
-    s.check("POST /splits 10 over 4 (4 real users) -> 200", r.status_code == 200, r.text[:200])
-    s.check("10 / 4 -> [3, 3, 2, 2]", r.json()["shares"] == [3, 3, 2, 2], str(r.json().get("shares")))
-    s.check("remainder units went to the FIRST participants", [p["handle"] for p in r.json()["parts"][:2]] == ["bob", "carol"], str(r.json()["parts"]))
-    s.check("parts sum back to the amount", sum(p["amount"] for p in r.json()["parts"]) == 10)
     s.check("sum invariant after split", invariant_ok(api.export().json()), invariant_detail(api.export().json()))
 
-    # ordering matters: reversed list must move the remainder
-    api.reset(FIXTURE)
-    api.client.post("/auth/signup", json={"email": "dave@example.com", "password": PW, "display_name": "D"})
-    alice, bob, carol, dave = (api.token(h) for h in ("alice", "bob", "carol", "dave"))
-    r = api.split(alice, 10, ["dave", "op", "carol", "bob"])
-    s.check("reversed order -> [3, 3, 2, 2] with remainder on dave/op", r.json()["shares"] == [3, 3, 2, 2] and r.json()["parts"][0]["handle"] == "dave", str(r.json().get("parts")))
+    r = api.split(alice, 10, ["bob", "carol", "dave", "op"])
+    s.check("POST /splits 10 over 4 -> 200", r.status_code == 200, r.text[:200])
+    s.check("10 / 4 -> [3, 3, 2, 2]", r.json().get("shares") == [3, 3, 2, 2], str(r.json().get("shares")))
+    s.check("remainder units went to the FIRST participants", [p["handle"] for p in r.json()["parts"][:2]] == ["bob", "carol"], str(r.json().get("parts")))
+    s.check("parts sum back to the amount", sum(p["amount"] for p in r.json()["parts"]) == 10)
 
+    # ordering matters: the reversed list must move the remainder
+    r = api.split(alice, 10, ["dave", "op", "carol", "bob"])
+    s.check(
+        "reversed order -> [3, 3, 2, 2] with the remainder on dave/op",
+        r.json().get("shares") == [3, 3, 2, 2] and [p["handle"] for p in r.json()["parts"][:2]] == ["dave", "op"],
+        str(r.json().get("parts")),
+    )
+
+    # payer in their own list is not debited
+    api.reset(RICH_FIXTURE)
+    alice = api.token("alice")
+    before = api.export().json()["balances"]
+    r = api.split(alice, 100, ["alice", "bob"])
+    after = api.export().json()["balances"]
+    s.check("payer in own list: shares still split evenly", r.json().get("shares") == [50, 50], str(r.json().get("shares")))
+    s.check("payer in own list: only the other party is debited", after["bob"] == before["bob"] - 50 and after["alice"] == before["alice"] + 50, f"{before} -> {after}")
+
+    # rejections
     api.reset(FIXTURE)
     alice = api.token("alice")
     snap = api.export().json()["balances"]
@@ -496,12 +538,20 @@ def w6(api: Api, s: Suite) -> None:
 
 def w7(api: Api, s: Suite) -> None:
     s.head("W7  idempotency on all 5 financial endpoints")
-    api.reset(FIXTURE)
+    api.reset(RICH_FIXTURE)
     alice, bob, carol, op = (api.token(h) for h in ("alice", "bob", "carol", "op"))
 
-    def replay_case(name, first, again, before_state, guard_key=None):
+    def replay_case(name, first_call, replay_call):
+        """Assert a replay returns the original response and moves no money.
+
+        The balance snapshot is taken *between* the first call and the replay,
+        so a change in `balances` means the replay really did re-process.
+        """
+        first = first_call()
         s.check(f"{name}: first call -> 2xx", first.status_code == 200, first.text[:200])
-        r2 = again()
+        before_state = api.export().json()["balances"]
+
+        r2 = replay_call()
         s.check(
             f"{name}: replay returns the ORIGINAL status",
             r2.status_code == first.status_code,
@@ -513,38 +563,51 @@ def w7(api: Api, s: Suite) -> None:
             "body differs",
         )
         after = api.export().json()
-        s.check(f"{name}: replay did not double-process (balances unchanged)", after["balances"] == before_state, f"{before_state} -> {after['balances']}")
+        s.check(
+            f"{name}: replay did not double-process (balances unchanged)",
+            after["balances"] == before_state,
+            f"{before_state} -> {after['balances']}",
+        )
         s.check(f"{name}: sum invariant after replay", invariant_ok(after), invariant_detail(after))
 
     # payments
-    api.pay(alice, "bob", 1000)
-    b = api.export().json()["balances"]
-    replay_case("POST /payments", api.pay(alice, "bob", 1000, key="k-pay"), lambda: api.pay(alice, "bob", 1000, key="k-pay"), b)
+    replay_case(
+        "POST /payments",
+        lambda: api.pay(alice, "bob", 1000, key="k-pay"),
+        lambda: api.pay(alice, "bob", 1000, key="k-pay"),
+    )
 
     # requests
-    r1 = api.request_(alice, "bob", 2000, key="k-req")
-    b = api.export().json()["balances"]
-    replay_case("POST /requests", r1, lambda: api.request_(alice, "bob", 2000, key="k-req"), b)
+    replay_case(
+        "POST /requests",
+        lambda: api.request_(alice, "bob", 2000, key="k-req"),
+        lambda: api.request_(alice, "bob", 2000, key="k-req"),
+    )
 
     # requests/{id}/pay
-    r2 = api.request_(alice, "bob", 3000, key="k-req2")
-    rid = r2.json()["id"]
-    p1 = api.act(bob, rid, "pay", key="k-pay-req")
-    b = api.export().json()["balances"]
-    replay_case("POST /requests/{id}/pay", p1, lambda: api.act(bob, rid, "pay", key="k-pay-req"), b)
+    rid = api.request_(alice, "bob", 3000, key="k-req2").json()["id"]
+    replay_case(
+        "POST /requests/{id}/pay",
+        lambda: api.act(bob, rid, "pay", key="k-pay-req"),
+        lambda: api.act(bob, rid, "pay", key="k-pay-req"),
+    )
 
     # splits
-    sp1 = api.split(alice, 300, ["bob", "carol", "op"], key="k-split")
-    b = api.export().json()["balances"]
-    replay_case("POST /splits", sp1, lambda: api.split(alice, 300, ["bob", "carol", "op"], key="k-split"), b)
+    replay_case(
+        "POST /splits",
+        lambda: api.split(alice, 300, ["bob", "carol", "dave"], key="k-split"),
+        lambda: api.split(alice, 300, ["bob", "carol", "dave"], key="k-split"),
+    )
 
     # settlements
-    st1 = api.settle(op, [{"from": "bob", "to": "carol", "amount": 400}], key="k-set")
-    b = api.export().json()["balances"]
-    replay_case("POST /settlements", st1, lambda: api.settle(op, [{"from": "bob", "to": "carol", "amount": 400}], key="k-set"), b)
+    replay_case(
+        "POST /settlements",
+        lambda: api.settle(op, [{"from": "bob", "to": "carol", "amount": 400}], key="k-set"),
+        lambda: api.settle(op, [{"from": "bob", "to": "carol", "amount": 400}], key="k-set"),
+    )
 
     # cross-user key independence
-    api.reset(FIXTURE)
+    api.reset(RICH_FIXTURE)
     alice, bob, carol, op = (api.token(h) for h in ("alice", "bob", "carol", "op"))
     shared = "shared-key-across-users"
     r_alice = api.pay(alice, "carol", 500, key=shared)
@@ -555,7 +618,12 @@ def w7(api: Api, s: Suite) -> None:
         r_alice.json()["payment_id"] != r_bob.json()["payment_id"],
         "the second call was swallowed as a replay",
     )
-    s.check("both debits actually happened", api.export().json()["balances"]["bob"] == 29500, str(api.export().json()["balances"]))
+    # carol is credited by both payments (10000 + 500 + 500), bob is debited one
+    s.check(
+        "both debits actually happened (bob 10000->9500, carol 10000->11000)",
+        api.export().json()["balances"]["bob"] == 9500 and api.export().json()["balances"]["carol"] == 11000,
+        str(api.export().json()["balances"]),
+    )
 
     # different key, same logical operation -> processes normally
     r2 = api.pay(alice, "carol", 500, key="a-different-key")
@@ -580,22 +648,27 @@ def w7(api: Api, s: Suite) -> None:
 
 def w8(api: Api, s: Suite) -> None:
     s.head("W8  activity + settlements")
-    api.reset(FIXTURE)
+    api.reset(RICH_FIXTURE)
     alice, bob, carol, op = (api.token(h) for h in ("alice", "bob", "carol", "op"))
 
     api.pay(alice, "bob", 111)
     rid = api.request_(alice, "bob", 222).json()["id"]
     api.act(bob, rid, "pay")
-    api.split(alice, 300, ["bob", "carol", "op"])
+    api.split(alice, 300, ["bob", "carol", "dave"])
     api.settle(op, [{"from": "carol", "to": "alice", "amount": 50}])
 
+    # The settlement is carol -> alice, so it appears in those two feeds only.
+    per_handle = {
+        "alice": {"payment", "request_created", "request_paid", "split", "settlement"},
+        "bob": {"payment", "request_created", "request_paid", "split"},
+        "carol": {"settlement"},
+    }
+    for handle, expected in per_handle.items():
+        types = {e["type"] for e in api.activity(api.token(handle)).json()["activity"]}
+        missing = sorted(expected - types)
+        s.check(f"activity contains {sorted(expected)} for {handle}", not missing, f"missing {missing}; has {sorted(types)}")
+
     feed = api.activity(alice).json()["activity"]
-    types = {e["type"] for e in feed}
-    for t in ("payment", "request_created", "request_paid", "split", "settlement"):
-        s.check(f"activity contains a `{t}` entry for alice", t in types, str(sorted(types)))
-    bob_types = {e["type"] for e in api.activity(bob).json()["activity"]}
-    for t in ("payment", "request_created", "request_paid", "split", "settlement"):
-        s.check(f"activity contains a `{t}` entry for bob", t in bob_types, str(sorted(bob_types)))
     s.check("activity is newest-first", [e["id"] for e in feed] == sorted([e["id"] for e in feed], reverse=True))
     s.check("activity only contains the caller's entries", all(e["handle"] == "alice" for e in feed))
     s.check("GET /activity unauthenticated -> 401", api.client.get("/activity").status_code == 401)
@@ -690,34 +763,64 @@ def concurrency(api: Api, s: Suite, requests_count: int = 60, threads: int = 20)
 
 def inventory(api: Api, s: Suite) -> None:
     s.head("spec section 3: all 16 endpoints exist")
-    api.reset(FIXTURE)
-    tok = api.token("alice")
-    bob = api.token("bob")
-    hdr = {"Authorization": f"Bearer {tok}"}
-    rid = api.request_(tok, "bob", 1).json()["id"]
 
-    probes = {
-        "GET  /health": lambda: api.health(),
-        "POST /_test/reset": lambda: api.reset(FIXTURE),
-        "GET  /_test/export": lambda: api.export(),
-        "POST /_test/import": lambda: api.import_(api.export().json()),
-        "POST /auth/signup": lambda: api.client.post("/auth/signup", json={"email": "zed@example.com", "password": PW, "display_name": "Z"}),
-        "POST /auth/login": lambda: api.login("alice@example.com"),
-        "GET  /me": lambda: api.me(tok),
-        "POST /payments": lambda: api.pay(tok, "bob", 1),
-        "POST /requests": lambda: api.request_(tok, "bob", 1),
-        "POST /requests/{id}/pay": lambda: api.act(bob, rid, "pay"),
-        "POST /requests/{id}/decline": lambda: api.act(bob, rid, "decline"),
-        "POST /requests/{id}/cancel": lambda: api.act(tok, rid, "cancel"),
-        "GET  /requests": lambda: api.client.get("/requests", headers=hdr),
-        "POST /splits": lambda: api.split(tok, 3, ["bob", "carol", "op"]),
-        "GET  /activity": lambda: api.activity(tok),
-        "POST /settlements": lambda: api.settle(api.token("op"), [{"from": "bob", "to": "carol", "amount": 1}]),
-    }
+    # The state-replacing endpoints run FIRST and eagerly: on a cold store
+    # there is no `alice` to authenticate as, and /_test/reset and
+    # /_test/import both wipe every bearer token. Tokens are minted after.
+    system_results = []
+    for name, fn in [
+        ("GET  /health", api.health),
+        ("POST /_test/reset", lambda: api.reset(FIXTURE)),
+        ("GET  /_test/export", api.export),
+        ("POST /_test/import", lambda: api.import_(api.export().json())),
+    ]:
+        try:
+            system_results.append((name, fn()))
+        except Exception as exc:  # noqa: BLE001
+            system_results.append((name, None, f"{type(exc).__name__}: {exc}"))
+
+    try:
+        tok = api.token("alice")
+        bob = api.token("bob")
+        op = api.token("op")
+        rids = [api.request_(tok, "bob", 1).json()["id"] for _ in range(3)]
+    except Exception as exc:  # noqa: BLE001
+        s.check("authenticated probes could be prepared", False, f"{type(exc).__name__}: {exc}")
+        return
+
+    authed_probes = [
+        ("POST /auth/signup", lambda: api.client.post("/auth/signup", json={"email": "zed@example.com", "password": PW, "display_name": "Z"})),
+        ("POST /auth/login", lambda: api.login("alice@example.com")),
+        ("GET  /me", lambda: api.me(tok)),
+        ("POST /payments", lambda: api.pay(tok, "bob", 1)),
+        ("POST /requests", lambda: api.request_(tok, "bob", 1)),
+        ("POST /requests/{id}/pay", lambda: api.act(bob, rids[0], "pay")),
+        ("POST /requests/{id}/decline", lambda: api.act(bob, rids[1], "decline")),
+        ("POST /requests/{id}/cancel", lambda: api.act(tok, rids[2], "cancel")),
+        ("GET  /requests", lambda: api.client.get("/requests", headers={"Authorization": f"Bearer {tok}"})),
+        ("POST /splits", lambda: api.split(tok, 3, ["bob", "carol"])),
+        ("GET  /activity", lambda: api.activity(tok)),
+        ("POST /settlements", lambda: api.settle(op, [{"from": "bob", "to": "carol", "amount": 1}])),
+    ]
+    probes = system_results + authed_probes
     s.check("all 16 endpoints are declared", len(probes) == 16, f"counted {len(probes)}")
-    for name, fn in probes.items():
-        r = fn()
-        s.check(f"{name} -> 2xx (no 404/405)", 200 <= r.status_code < 300, f"got {r.status_code} {r.text[:120]}")
+
+    for entry in probes:
+        if len(entry) == 3:
+            s.check(f"{entry[0]} -> 2xx (no 404/405)", False, entry[2])
+            continue
+        name, resp = entry
+        if callable(resp):
+            try:
+                resp = resp()
+            except Exception as exc:  # noqa: BLE001
+                s.check(f"{name} -> 2xx (no 404/405)", False, f"{type(exc).__name__}: {exc}")
+                continue
+        s.check(
+            f"{name} -> 2xx (no 404/405)",
+            200 <= resp.status_code < 300,
+            f"got {resp.status_code} {resp.text[:120]}",
+        )
 
 
 def main() -> int:
@@ -726,7 +829,8 @@ def main() -> int:
     parser.add_argument("--skip-concurrency", action="store_true")
     args = parser.parse_args()
 
-    api = Api(args.base)
+    s = Suite()
+    api = Api(args.base, on_error=lambda what, detail: s.check(what, False, detail))
     try:
         api.health()
     except Exception as exc:  # noqa: BLE001
@@ -734,20 +838,28 @@ def main() -> int:
         print("\n=== SUMMARY: 0 passed, 1 failed, 0 skipped ===")
         return 1
 
-    s = Suite()
     print(f"pocketful stage-1 verification against {args.base}")
-    w1(api, s)
-    inventory(api, s)
-    w2(api, s)
-    w3(api, s)
-    w4(api, s)
-    w5(api, s)
-    w6(api, s)
-    w7(api, s)
-    w8(api, s)
+
+    # Each work item is isolated: a crash inside one section is recorded as a
+    # failure and the rest of the suite still runs, so a broken build still
+    # produces a complete verdict rather than a truncated log.
+    sections = [
+        ("W1", w1), ("inventory", inventory), ("W2", w2), ("W3", w3),
+        ("W4", w4), ("W5", w5), ("W6", w6), ("W7", w7), ("W8", w8),
+    ]
     if not args.skip_concurrency:
-        concurrency(api, s)
-    else:
+        sections.append(("concurrency", lambda a, su: concurrency(a, su)))
+
+    for name, fn in sections:
+        try:
+            fn(api, s)
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+
+            s.check(f"{name} section ran to completion", False, f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+
+    if args.skip_concurrency:
         s.head("concurrency")
         s.check("concurrency hammer", True, "SKIPPED via --skip-concurrency")
     return s.summary()

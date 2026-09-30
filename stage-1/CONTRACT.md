@@ -107,10 +107,13 @@ left intact (import is all-or-nothing).
 ```
 
 * `handle` is **derived from the email**: local part lower-cased, every
-  character outside `[a-z0-9_]` dropped, truncated to 20, then validated
-  against `^[a-z0-9_]{1,20}$`. `Alice.Smith@…` → `alicesmith`.
+  character outside `[a-z0-9_]` dropped, then validated against
+  `^[a-z0-9_]{1,20}$` **without truncation**.
+  `Alice.Smith@…` → `alicesmith`. Truncation is deliberately not performed: it
+  would map distinct emails onto a single handle and defeat the regex.
   An email whose local part sanitises to nothing (`"!!!@x.com"`) fails the
-  regex → `422 invalid_handle`.
+  regex → `422 invalid_handle`; so does a sanitised local part longer than
+  20 characters (`"a"*40 + "@example.com"`) → `422 invalid_handle`.
 * An **optional explicit `handle`** is also accepted: it must match the regex
   (`422 invalid_handle` otherwise) and, when valid, is used as the handle.
 * Duplicate email → `409 email_taken`; duplicate handle → `409 handle_taken`.

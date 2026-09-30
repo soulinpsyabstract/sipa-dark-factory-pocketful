@@ -7,7 +7,13 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 
-from ..dependencies import get_current_user, is_operator_email, issue_token, store, user_public
+from ..dependencies import (
+    _user_public,
+    get_current_user,
+    is_operator_email,
+    issue_token,
+    store,
+)
 from ..errors import AppError, conflict, unauthorized, validation_error
 from ..schemas import LoginIn, SignupIn
 from ..security import hash_password, verify_password
@@ -32,9 +38,11 @@ def signup(body: SignupIn) -> JSONResponse:
     """Create a user.
 
     The handle is derived from the email local part: lower-cased, stripped of
-    every character outside ``[a-z0-9_]``, truncated to 20, then validated
-    against ``^[a-z0-9_]{1,20}$``. A local part that sanitises to nothing
-    (``"!!!@x.com"``) fails the regex -> 422 ``invalid_handle``.
+    every character outside ``[a-z0-9_]``, then validated against
+    ``^[a-z0-9_]{1,20}$`` **without truncation** -- truncating would collapse
+    distinct emails onto one handle. A local part that sanitises to nothing
+    (``"!!!@x.com"``), or that exceeds 20 characters once sanitised, fails the
+    regex -> 422 ``invalid_handle``.
 
     A client may pass an explicit ``handle``; it is validated against the same
     regex (422 if it does not match) and, when valid, becomes the handle.
@@ -75,7 +83,8 @@ def signup(body: SignupIn) -> JSONResponse:
         # not change the sum, and I2 true because 0 is not negative.
         store.balances.setdefault(handle, 0)
         store._check_invariants()
-        public = user_public(store.users[handle])
+        # _user_public, not user_public: the lock is already held here.
+        public = _user_public(store.users[handle], store.balances)
         return {"status": "ok", "handle": handle, "user": public, **public}
 
     return JSONResponse(status_code=200, content=store.transaction(work))
@@ -93,7 +102,7 @@ def login(body: LoginIn) -> JSONResponse:
         if user is None or not verify_password(body.password, user["password_hash"]):
             raise unauthorized("invalid email or password", code="invalid_credentials")
         token = issue_token(user["handle"])
-        public = user_public(user)
+        public = _user_public(user, store.balances)
         return {
             "status": "ok",
             "access_token": token,
@@ -110,5 +119,5 @@ def login(body: LoginIn) -> JSONResponse:
 @router.get("/me")
 def me(handle: Annotated[str, Depends(get_current_user)]) -> JSONResponse:
     """Current authenticated user. 401 without a valid bearer token."""
-    public = store.read(lambda: user_public(store.users[handle]))
+    public = store.read(lambda: _user_public(store.users[handle], store.balances))
     return JSONResponse(status_code=200, content={"status": "ok", "handle": handle, "user": public, **public})

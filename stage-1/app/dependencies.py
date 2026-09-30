@@ -73,12 +73,23 @@ def require_operator(handle: str) -> dict:
     return user
 
 
-def user_public(user: dict) -> dict:
+def _user_public(user: dict, balances: dict[str, int]) -> dict[str, Any]:
+    """Lock-free projection of a user.
+
+    ``threading.Lock`` is NOT reentrant, so this must never take the lock:
+    it is called both from inside ``store.transaction(...)`` and, via
+    ``user_public``, from read-only paths.
+    """
     return {
         "handle": user["handle"],
         "email": user["email"],
         "display_name": user["display_name"],
         "is_operator": bool(user.get("is_operator", False)),
-        "balance": store.read(lambda: store.balances.get(user["handle"], 0)),
-        "created_at": user.get("created_at", now_iso()),
+        "balance": balances.get(user["handle"], 0),
+        "created_at": user.get("created_at") or "",
     }
+
+
+def user_public(user: dict) -> dict[str, Any]:
+    """Public projection, taking the lock. Never call while holding it."""
+    return store.read(lambda: _user_public(user, store.balances))

@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
+from .errors import AppError
 from .routers import auth, operations, system
 from .store import InvariantViolation
 
@@ -34,22 +35,34 @@ app = FastAPI(
 # ----------------------------------------------------------------------
 
 
+@app.exception_handler(AppError)
+async def app_error(request: Request, exc: AppError) -> JSONResponse:
+    """Registered on its own handler, NOT via ``Exception``.
+
+    Starlette routes a dedicated handler through ``ExceptionMiddleware``,
+    which returns the response normally. A catch-all ``Exception`` handler
+    goes through ``ServerErrorMiddleware``, which re-raises after building
+    the response - so an ``AppError`` registered only as ``Exception`` would
+    escape as an unhandled exception instead of becoming its 4xx.
+    """
+    return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
+
+
+@app.exception_handler(InvariantViolation)
+async def invariant_broken(request: Request, exc: InvariantViolation) -> JSONResponse:
+    """I1-I4 must never be silently broken; surface it loudly as a 500."""
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": f"invariant violated: {exc}",
+            "code": "invariant_violation",
+            "error": {"code": "invariant_violation", "message": str(exc)},
+        },
+    )
+
+
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception) -> JSONResponse:
-    from .errors import AppError
-
-    if isinstance(exc, AppError):
-        return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
-    if isinstance(exc, InvariantViolation):
-        # I1-I4 must never be silently broken; surface it loudly instead.
-        return JSONResponse(
-            status_code=500,
-            content={
-                "detail": f"invariant violated: {exc}",
-                "code": "invariant_violation",
-                "error": {"code": "invariant_violation", "message": str(exc)},
-            },
-        )
     raise exc
 
 
