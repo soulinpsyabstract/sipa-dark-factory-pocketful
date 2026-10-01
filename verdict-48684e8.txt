@@ -76,8 +76,10 @@ refreshed 2026-10-01 after close; earlier text reflected an open state.)
     verifier harness committed at 9072542 (verify/: container_check.py,
     image_source_check.py, verify.py). Working tree clean.
   - Containers torn down on operator GO (pf-s3-48684e8 18080, pf 8090).
-  - Stray probe_270dbb19.py (unrelated CONTRACT.md lineage) preserved at
-    Temp/opencode/probe_270dbb19.py, intentionally not committed.
+  - Stray probe_270dbb19.py (unrelated 270dbb19 / CONTRACT.md lineage; found in
+    verify/ at close, not authored for and never part of this verdict) was moved
+    out of verify/ at 9072542, later removed with the authorized Temp/opencode/
+    cleanup, and is NOT retained. It is not evidence for this record.
 
 -----------------------------------------------------------------------------
 ADDENDUM: review of 3f79262 "isolate the deadlock guard in a child process"
