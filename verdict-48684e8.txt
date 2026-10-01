@@ -1,0 +1,116 @@
+VERDICT on commit 48684e8 (SipaOsV3 verifier): ACCEPT
+2026-10-01
+
+1) MUTATION TEST OF THE THREE NEW GUARDS (all RED vs reintroduced 127c64f P0,
+   all GREEN on byte-clean restore -> no guard stayed green -> NO P1)
+    - Scratch copy mut48684e8 rebuilt byte-identical from immutable worktree
+      pf-48684e8 (0 hash mismatches). Baseline full suite: 60 passed.
+    - Mutation: reinstated `def user_public` taking the lock via store.read in
+      app/dependencies.py; called it from inside work() in signup + login.
+    - test_public_projection_helpers_take_no_lock      -> RED (1.05s):
+        "app/dependencies.py defines a lock-taking user_public(); it is a trap"
+    - test_no_nested_lock_acquisition_in_app_package   -> RED (1.09s):
+        offenders headed by auth.py:91 (signup work) and auth.py:117 (login work)
+    - test_authenticated_surface_never_self_deadlocks  -> RED via bounded 20s
+        join: pytest recorded FAILED; worker thread stuck in lock.acquire().
+    - TEARDOWN CAVEAT (its own line, so it is not later re-litigated):
+        In the MUTATED world, pytest records the test as FAILED at the bounded
+        join, then stalls in TestClient.close() (portal.close blocks on the
+        deadlocked in-flight request). Demonstrated live and killed. This stall
+        is DOWNSTREAM of the intentionally-introduced deadlock - it is a
+        property of the test's fixture teardown, NOT of the guard, and NOT a
+        false green. On healthy code the path completes with no hang (both the
+        guard and the full 60-pass suite ran to completion post-restore).
+    - Revert: byte-clean vs worktree (0 mismatches, 0 user_public defs, .bak
+      residue removed) -> 3 guards PASS (1.61s) -> full suite 60 passed (38.5s).
+
+2) INTEGRITY GATE (image_source_check.py on pre-existing verify-48684e8,
+   which survived the Docker daemon crash): PASS
+   - IMAGE_AGE: commit 2026-09-30T14:44:27Z, image 14:54:02Z -> PASS
+   - BLOB_HASH: store.py 8405203c1d0e, dependencies.py ec537c86133d,
+        in-image == committed blobs at 48684e8 -> PASS
+   - Independently re-confirmed by Core (recomputed blob SHA-1 with Python,
+     since the slim image has no git): store.py 8405203c1d0e,
+     dependencies.py ec537c86133d, auth.py 96a925acd254, all == committed
+     blobs at 48684e8.
+
+3) CONTAINER CHECKS (container_check.py --skip-build --ports 8080,9099,5555):
+   11 passed / 0 failed. Default port 8080 + PORT=9099 and PORT=5555 overrides
+   honoured; /health -> {"status":"ok"}.
+
+4) FUNCTIONAL (verify.py against fresh container pf-s3-48684e8 on 18080):
+   53 passed / 0 failed. 16 endpoints, invariants, idempotency, splits,
+   concurrency; no 5xx leaked, sum invariant preserved under concurrency.
+
+5) BUILDER CLAIMS and the ACCEPTED NUMBERS:
+   - pytest 60 passed           -> REPRODUCED (60 passed, twice)
+   - PORT=5555 {"status":"ok"}  -> REPRODUCED (container_check override)
+   - 174 passed, 0 failed       -> the builder's OWN harness count. IT IS NOT
+        THE ACCEPTED OR VERIFIED FIGURE. Do not later read "174" as this
+        verdict's number; it is not comparable to pytest (60) or to this
+        seat's independent harness (53/53). "174" was not reproduced here
+        (their runner is not in this repo). The figures this verdict stands
+        on: pytest 60 passed (reproduced twice) + independent functional
+        harness 53 passed/0 failed against a gate-passed, commit-exact image,
+        plus image integrity and container/PORT checks above.
+
+HARNESS NOTES (both are verifier-harness fixes, not app bugs):
+   - verify.py expected 'a b@x.com' signup to be sanitised-and-accepted; spec
+     EMAIL_RE forbids whitespace in the local part -> 422 invalid_email is
+     correct. Expectation corrected; full suite re-ran 53/53 green.
+   - Static guard's offender list under mutation additionally flags
+     operations/system store.transaction(work) sites - a name-collision
+     artifact (flags every closure named `work` when any one takes the lock).
+     Over-flags, never under; zero offenders on healthy code.
+
+ARTIFACTS (Temp/opencode):
+   - pytest-baseline.log, pytest-mutated2.log, deadlock-demo.out
+   - container_check-48684e8.log, verify-48684e8-18080b.log
+   - mutate_guards.py, mut48684e8/ (restored, byte-clean)
+   - image_source_check.py, container_check.py, verify.py (repo verify/)
+
+STATUS: target verified at 48684e8, ACCEPT. pf-s3-48684e8 container left up on
+18080 for operator inspection. Cleanup of scratch artifacts pending operator OK.
+
+-----------------------------------------------------------------------------
+ADDENDUM: review of 3f79262 "isolate the deadlock guard in a child process"
+2026-10-01 (builder-reported follow-up commit on top of 48684e8; test-only)
+
+  Purpose: replace the thread-based _call_within probe with a multiprocessing
+  spawn child (own app, own store global) under a 60s wall-clock bound, so a
+  reintroduced deadlock fails the one test in bounded time and cannot poison
+  the pytest session via TestClient.close() / the held store lock. This closes
+  the teardown-stall caveat from section 1.
+
+  Re-verification (this seat, independent of builder):
+    - git state: HEAD=3f79262; diff 48684e8..HEAD --name-only = exactly
+      stage-1/tests/test_stage1.py (+82/-58); porcelain clean (only untracked verify/).
+    - App blobs at 3f79262 identical to ACCEPTed 48684e8: store.py
+      8405203c1d0e, dependencies.py ec537c86133d, auth.py 96a925acd254.
+      No application code changed -> image/container evidence from the 48684e8
+      ACCEPT remains valid; no functional re-run required.
+    - Healthy tree (scratch byte-identical to worktree pf-3f79262, 0 mismatches):
+      full suite 60 passed in 32.16s (builder reported 31.86s; reproduced). No
+      teardown stall on healthy code.
+    - Mutation re-run: scratch dependencies.py + auth.py overwritten with the
+      LITERAL 127c64f blobs (git hash-object matched: deps 54e37da6, auth
+      0dea4c79; store.py untouched at current). Three guards against the
+      reintroduced P0:
+        * test_authenticated_surface_never_self_deadlocks -> RED at the 60s
+          bound, SUITE COMPLETED with exit 1 in 61.21s and NO teardown stall
+          (this was the defect: the old in-process guard hung the session here).
+        * test_no_nested_lock_acquisition_in_app_package -> RED (~1s), naming
+          auth.py:81, auth.py:107 (work takes the lock) and auth.py:113 (inline
+          store.read callback calls user_public()); extra operations/system
+          rows are the same conservative name-collision artifact as before.
+        * test_public_projection_helpers_take_no_lock -> RED ("lock-taking
+          user_public(); it is a trap").
+    - Restore: byte-clean vs worktree (0 mismatches, 0 .bak residue, 0
+      user_public defs); deadlock guard PASS solo (3.26s).
+    - 174 vs 53/60: unchanged; 3f79262 adds no harness-number changes to the
+      ACCEPTed figures.
+
+  VERDICT on 3f79262: ACCEPT as an incremental, test-only hardening of the
+  ACCEPTed 48684e8. No application bytes changed; the guard now fails in
+  bounded time WITHOUT poisoning the session, which removes the previously
+  documented teardown caveat. No P1.
