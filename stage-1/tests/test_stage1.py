@@ -604,75 +604,99 @@ def test_no_state_leaks_between_fixtures(client):
 # ======================================================================
 
 
-def _call_within(fn, timeout):
-    """Run ``fn`` on a worker thread and hard-fail if it does not return.
+def _authenticated_surface_probe(q):
+    """Child-process body: exercise the authenticated surface, report statuses.
 
-    A deadlocked request never raises and never returns, so the only honest
-    assertion here is a wall-clock one: the worker must finish and the test
-    must FAIL when it does not. ``pytest-timeout`` is not a dependency, and a
-    plain ``assert resp.status_code == 200`` is worthless because a hang means
-    that line is never reached.
+    Runs in a *spawned* process so it gets its own copy of the app and its own
+    ``store`` global. A deadlocked request inside this process therefore cannot
+    poison the pytest session, and the parent can simply terminate us.
     """
-    box = {}
+    from fastapi.testclient import TestClient
 
-    def worker():
-        try:
-            box["resp"] = fn()
-        except BaseException as exc:  # noqa: BLE001
-            box["exc"] = exc
+    from app.main import app as child_app
 
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(timeout)
-    assert not t.is_alive(), (
-        f"call did not return within {timeout}s - the request is deadlocked. "
-        f"threading.Lock() is not reentrant, so a lock-taking helper was almost "
-        f"certainly called from inside store.transaction(...)."
-    )
-    assert "exc" not in box, f"request raised: {box['exc']!r}"
-    return box["resp"]
+    out: dict[str, object] = {}
+    try:
+        with TestClient(child_app) as c:
+            c.post("/_test/reset", json=FIXTURE)
+            r = c.post(
+                "/auth/signup",
+                json={"email": "noah@example.com", "password": PW, "display_name": "Noah"},
+            )
+            out["signup"] = r.status_code
+            out["signup_handle"] = r.json().get("handle") if r.status_code == 200 else None
+
+            r = c.post("/auth/login", json={"email": "alice@example.com", "password": PW})
+            out["login"] = r.status_code
+            tok = r.json().get("access_token") if r.status_code == 200 else None
+
+            if tok:
+                r = c.get("/me", headers={"Authorization": f"Bearer {tok}"})
+                out["me"] = r.status_code
+                out["me_handle"] = r.json().get("handle") if r.status_code == 200 else None
+
+                r = c.post(
+                    "/payments",
+                    json={"to": "bob", "amount": 100},
+                    headers={"Authorization": f"Bearer {tok}"},
+                )
+                out["payment"] = r.status_code
+
+            r = c.get("/health")
+            out["health"] = r.status_code
+    except BaseException as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    q.put(out)
 
 
-def test_authenticated_surface_never_self_deadlocks(client):
+def test_authenticated_surface_never_self_deadlocks():
     """P0 regression: signup/login/me must return, not hang.
 
     At commit 127c64f the first ``POST /auth/signup`` blocked forever, which
-    poisoned the whole instance. Each call is made on its own thread with a
-    join timeout so a reintroduced deadlock fails the suite instead of hanging
-    it, and the instance is checked for health afterwards.
+    poisoned the whole instance. The failure mode is a *hang*, so a data-only
+    assertion is worthless - it would never be reached. The probe therefore runs
+    in a spawned child process with a hard wall-clock bound: a reintroduced
+    deadlock makes the child fail to exit, and this test FAILS instead of
+    hanging the suite.
+
+    The child-process isolation matters as much as the bound. An in-process
+    deadlocked request leaves ``store.lock`` held forever, which then stalls
+    ``TestClient.close()`` in fixture teardown and hangs every *subsequent*
+    test in the session - so the guard would trade one hang for another.
     """
-    timeout = 20.0
+    import multiprocessing as mp
 
-    r = _call_within(
-        lambda: client.post(
-            "/auth/signup",
-            json={"email": "noah@example.com", "password": PW, "display_name": "Noah"},
-        ),
-        timeout,
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["handle"] == "noah"
+    timeout = 60
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    proc = ctx.Process(target=_authenticated_surface_probe, args=(q,), daemon=True)
+    proc.start()
+    proc.join(timeout)
 
-    r = _call_within(
-        lambda: client.post("/auth/login", json={"email": "alice@example.com", "password": PW}),
-        timeout,
-    )
-    assert r.status_code == 200, r.text
-    tok = r.json()["access_token"]
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(10)
+        if proc.is_alive():  # pragma: no cover - terminate is best effort
+            proc.kill()
+            proc.join(10)
+        pytest.fail(
+            f"the authenticated surface did not return within {timeout}s - the request is "
+            f"deadlocked. threading.Lock() is not reentrant, so a lock-taking helper was "
+            f"almost certainly called from inside store.transaction(...)."
+        )
 
-    r = _call_within(lambda: client.get("/me", headers=auth(tok)), timeout)
-    assert r.status_code == 200, r.text
-    assert r.json()["handle"] == "alice"
+    assert q.empty() is False, "probe process exited without reporting a result"
+    out = q.get_nowait()
+    assert "error" not in out, f"probe raised: {out['error']}"
 
+    assert out.get("signup") == 200, f"POST /auth/signup -> {out.get('signup')}"
+    assert out.get("signup_handle") == "noah", out.get("signup_handle")
+    assert out.get("login") == 200, f"POST /auth/login -> {out.get('login')}"
+    assert out.get("me") == 200, f"GET /me -> {out.get('me')}"
+    assert out.get("me_handle") == "alice", out.get("me_handle")
     # the instance must still be usable: a stuck lock would show up here too
-    r = _call_within(
-        lambda: client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(tok)),
-        timeout,
-    )
-    assert r.status_code == 200, r.text
-
-    r = _call_within(lambda: client.get("/health"), timeout)
-    assert r.status_code == 200, r.text
+    assert out.get("payment") == 200, f"POST /payments -> {out.get('payment')}"
+    assert out.get("health") == 200, f"GET /health -> {out.get('health')}"
 
 
 def test_store_lock_is_not_reentrant():
