@@ -69,8 +69,15 @@ ARTIFACTS (Temp/opencode):
    - mutate_guards.py, mut48684e8/ (restored, byte-clean)
    - image_source_check.py, container_check.py, verify.py (repo verify/)
 
-STATUS: target verified at 48684e8, ACCEPT. pf-s3-48684e8 container left up on
-18080 for operator inspection. Cleanup of scratch artifacts pending operator OK.
+STATUS: target verified at 48684e8, ACCEPT. Record closed. (Status line
+refreshed 2026-10-01 after close; earlier text reflected an open state.)
+  - 48684e8 ACCEPT; 3f79262 ACCEPT (incremental, test-only); no P1.
+  - Verdict record + addendum committed at 166e964 (repo root);
+    verifier harness committed at 9072542 (verify/: container_check.py,
+    image_source_check.py, verify.py). Working tree clean.
+  - Containers torn down on operator GO (pf-s3-48684e8 18080, pf 8090).
+  - Stray probe_270dbb19.py (unrelated CONTRACT.md lineage) preserved at
+    Temp/opencode/probe_270dbb19.py, intentionally not committed.
 
 -----------------------------------------------------------------------------
 ADDENDUM: review of 3f79262 "isolate the deadlock guard in a child process"
