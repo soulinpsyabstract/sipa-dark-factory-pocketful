@@ -84,7 +84,7 @@ def signup(body: SignupIn) -> JSONResponse:
         store.balances.setdefault(handle, 0)
         store._check_invariants()
         # _user_public, not a lock-taking projection: the lock is already held.
-        public = _user_public(store.users[handle], store.balances)
+        public = _user_public(store.users[handle], store.balances, store._funds(handle))
         return {"status": "ok", "handle": handle, "user": public, **public}
 
     return JSONResponse(status_code=200, content=store.transaction(work))
@@ -102,7 +102,7 @@ def login(body: LoginIn) -> JSONResponse:
         if user is None or not verify_password(body.password, user["password_hash"]):
             raise unauthorized("invalid email or password", code="invalid_credentials")
         token = issue_token(user["handle"])
-        public = _user_public(user, store.balances)
+        public = _user_public(user, store.balances, store._funds(user["handle"]))
         return {
             "status": "ok",
             "access_token": token,
@@ -119,5 +119,5 @@ def login(body: LoginIn) -> JSONResponse:
 @router.get("/me")
 def me(handle: Annotated[str, Depends(get_current_user)]) -> JSONResponse:
     """Current authenticated user. 401 without a valid bearer token."""
-    public = store.read(lambda: _user_public(store.users[handle], store.balances))
+    public = store.read(lambda: _user_public(store.users[handle], store.balances, store._funds(handle)))
     return JSONResponse(status_code=200, content={"status": "ok", "handle": handle, "user": public, **public})

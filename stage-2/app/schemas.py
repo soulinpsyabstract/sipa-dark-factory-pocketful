@@ -127,6 +127,10 @@ class FixtureIn(BaseModel):
     balances: dict[str, int] = Field(default_factory=dict)
     seeded_total: int | None = None
     total: int | None = None
+    #: stage-2: seeded open authorizations. These are held against the seeded
+    #: balances, so a fixture that over-holds is rejected 422
+    #: validation_failed and the live state is left untouched.
+    authorizations: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def to_fixture_dict(payload: Any) -> dict[str, Any]:

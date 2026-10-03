@@ -73,7 +73,11 @@ def require_operator(handle: str) -> dict:
     return user
 
 
-def _user_public(user: dict, balances: dict[str, int]) -> dict[str, Any]:
+def _user_public(
+    user: dict,
+    balances: dict[str, int],
+    funds: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """The single public projection of a user. **Lock-free by contract.**
 
     ``threading.Lock`` is NOT reentrant, so this function must never take the
@@ -87,14 +91,26 @@ def _user_public(user: dict, balances: dict[str, int]) -> dict[str, Any]:
     invites the next self-deadlock - someone calls it from inside a ``work()``
     and the whole authenticated surface hangs again.
 
+    ``funds`` is the store's already-computed ``{total, held, available}``
+    triple for this handle. It is passed in rather than looked up here so the
+    function stays lock-free; callers holding the lock use ``store._funds(...)``.
+
     ``tests/test_stage1.py::test_public_projection_helpers_take_no_lock`` and
     ``test_no_nested_lock_acquisition_in_app_package`` enforce this statically.
     """
+    handle = user["handle"]
+    balance = balances.get(handle, 0)
+    held = int(funds["held"]) if funds else 0
     return {
-        "handle": user["handle"],
+        "handle": handle,
         "email": user["email"],
         "display_name": user["display_name"],
         "is_operator": bool(user.get("is_operator", False)),
-        "balance": balances.get(user["handle"], 0),
+        "balance": balance,
+        # stage-2 funds triple: total is the balance, held is reserved by open
+        # authorizations, available is what can actually be spent.
+        "total": balance,
+        "held": held,
+        "available": balance - held,
         "created_at": user.get("created_at") or "",
     }

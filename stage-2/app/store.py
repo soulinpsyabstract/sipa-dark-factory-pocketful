@@ -38,9 +38,46 @@ _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2x$", "$2y$")
 REQUEST_STATUSES = ("open", "paid", "declined", "cancelled")
 TERMINAL_REQUEST_STATUSES = ("paid", "declined", "cancelled")
 
+AUTHORIZATION_STATUSES = ("open", "captured", "voided", "expired")
+TERMINAL_AUTHORIZATION_STATUSES = ("captured", "voided", "expired")
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp into an aware datetime, or ``None``.
+
+    ``None`` means "no usable timestamp", which callers read as "does not
+    expire" rather than as an error, so a partially specified fixture record
+    cannot wedge the funds model.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text[-1] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def authorization_open_at(record: dict[str, Any], now: datetime) -> bool:
+    """True while ``record`` still holds funds: ``open`` and not past expiry.
+
+    Deliberately a pure predicate over ``(record, now)`` so the lazy-expiry
+    sweep, the ``held`` computation and fixture validation all share one
+    definition that cannot drift from the others.
+    """
+    if record.get("status") != "open":
+        return False
+    expires_at = parse_iso(record.get("expires_at"))
+    return expires_at is None or expires_at > now
 
 
 def is_bcrypt_hash(value: Any) -> bool:
@@ -62,6 +99,7 @@ class Store:
         self.users: dict[str, dict[str, Any]] = {}
         self.balances: dict[str, int] = {}
         self.requests: dict[str, dict[str, Any]] = {}
+        self.authorizations: dict[str, dict[str, Any]] = {}
         self.activity: list[dict[str, Any]] = []
         self.idempotency: dict[tuple[str, str], dict[str, Any]] = {}
         self.tokens: dict[str, str] = {}
@@ -73,6 +111,7 @@ class Store:
             "split": itertools.count(1),
             "settlement": itertools.count(1),
             "activity": itertools.count(1),
+            "authorization": itertools.count(1),
         }
 
     # ------------------------------------------------------------------
@@ -135,12 +174,29 @@ class Store:
             if not is_bcrypt_hash(user.get("password_hash")):
                 raise InvariantViolation(f"I4 broken: non-bcrypt password_hash for {handle!r}")
 
+        # I5 - a hold can never exceed a balance, so available is never negative
+        now = datetime.now(timezone.utc)
+        for handle in self.users:
+            held = self._held_amount(handle, now)
+            balance = self.balances.get(handle, 0)
+            if held < 0:
+                raise InvariantViolation(f"I5 broken: negative hold for {handle!r}: {held}")
+            if held > balance:
+                raise InvariantViolation(
+                    f"I5 broken: held {held} exceeds balance {balance} for {handle!r}; "
+                    "available would be negative"
+                )
+
     def invariant_report(self) -> dict[str, Any]:
         total = sum(self.balances.values())
         negative = sorted(h for h, b in self.balances.items() if b < 0)
         unknown = sorted(h for h in self.balances if h not in self.users)
         plaintext = sorted(
             h for h, u in self.users.items() if not is_bcrypt_hash(u.get("password_hash"))
+        )
+        now = datetime.now(timezone.utc)
+        over_held = sorted(
+            h for h in self.users if self._held_amount(h, now) > self.balances.get(h, 0)
         )
         return {
             "sum_of_balances": total,
@@ -152,6 +208,13 @@ class Store:
             "orphan_balances": unknown,
             "no_plaintext_passwords": not plaintext,
             "plaintext_password_users": plaintext,
+            # stage-2 funds invariant
+            "holds_within_balance": not over_held,
+            "over_held_users": over_held,
+            "no_negative_available": not over_held,
+            "open_authorizations": sum(
+                1 for r in self.authorizations.values() if authorization_open_at(r, now)
+            ),
         }
 
     def assert_invariants(self) -> None:
@@ -168,12 +231,84 @@ class Store:
         return user
 
     def _transfer(self, frm: str, to: str, amount: int) -> None:
-        """Move minor units. Caller has already checked both users exist."""
-        available = self.balances.get(frm, 0)
-        if available < amount:
-            raise insufficient_funds(frm, available, amount)
-        self.balances[frm] = available - amount
+        """Move minor units. Caller has already checked both users exist.
+
+        The debit is measured against **available**, not raw balance, so funds
+        held by an open authorization can never be spent. That makes this the
+        single choke point for "held funds are unspendable": every debit path
+        (payments, request pay, splits, settlements, capture) funnels through
+        here. With no authorizations present ``available == balance``, so
+        Stage-1 behaviour is bit-for-bit unchanged.
+        """
+        self._require_available(frm, amount)
+        self.balances[frm] = self.balances[frm] - amount
         self.balances[to] = self.balances.get(to, 0) + amount
+
+    # ------------------------------------------------------------------
+    # funds: total / held / available  (stage-2 section 3)
+    #
+    #   held      = sum(amount of the user's unexpired *open* authorizations)
+    #   available = total - held        (>= 0 by invariant I5)
+    #
+    # Every helper below is lock-free: callers already hold self.lock.
+    # ------------------------------------------------------------------
+
+    def _expire_authorizations(self, now: datetime | None = None) -> int:
+        """Lazily transition overdue open authorizations to ``expired``.
+
+        There is no background timer. Any read or write that observes an
+        authorization past its ``expires_at`` performs the transition here,
+        which releases its hold. Expiry creates no activity entry: it is an
+        authorization lifecycle event, not a money movement.
+        """
+        moment = now or datetime.now(timezone.utc)
+        stamp = moment.isoformat()
+        changed = 0
+        for record in self.authorizations.values():
+            if record.get("status") != "open":
+                continue
+            expires_at = parse_iso(record.get("expires_at"))
+            if expires_at is None or expires_at > moment:
+                continue
+            record["status"] = "expired"
+            record["updated_at"] = stamp
+            record["closed_at"] = stamp
+            changed += 1
+        return changed
+
+    def _held_amount(self, handle: str, now: datetime | None = None) -> int:
+        """Sum of the user's unexpired open authorization amounts."""
+        moment = now or datetime.now(timezone.utc)
+        held = 0
+        for record in self.authorizations.values():
+            if record.get("from") != handle:
+                continue
+            if authorization_open_at(record, moment):
+                held += int(record.get("amount") or 0)
+        return held
+
+    def _available_amount(self, handle: str, now: datetime | None = None) -> int:
+        return self.balances.get(handle, 0) - self._held_amount(handle, now)
+
+    def _funds(self, handle: str, now: datetime | None = None) -> dict[str, int]:
+        """The funds triple for one user: total, held and available."""
+        moment = now or datetime.now(timezone.utc)
+        total = self.balances.get(handle, 0)
+        held = self._held_amount(handle, moment)
+        return {
+            "total": total,
+            "balance": total,
+            "held": held,
+            "available": total - held,
+        }
+
+    def _require_available(self, handle: str, amount: int, now: datetime | None = None) -> int:
+        """Raise ``insufficient_funds`` unless ``handle`` can spend ``amount``."""
+        moment = now or datetime.now(timezone.utc)
+        available = self._available_amount(handle, moment)
+        if available < amount:
+            raise insufficient_funds(handle, available, amount)
+        return available
 
     # ------------------------------------------------------------------
     # fixture handling (reset / import share this)
@@ -265,15 +400,145 @@ class Store:
                 code="fixture_total_mismatch",
             )
 
+        # Seeded authorizations are parsed and fully validated BEFORE anything is
+        # assigned, so a rejected fixture leaves the live world untouched - the
+        # 422 validation_failed path is atomic by construction.
+        authorizations = self._parse_authorization_records(fixture.get("authorizations") or [])
+
         self.users = users
         self.balances = balances
         self.seeded_total = seeded_total
         self.requests = {}
+        self.authorizations = authorizations
         self.activity = []
         self.idempotency = {}
         self.tokens = {}
         self._ids = {k: itertools.count(1) for k in self._ids}
+        self._sync_authorization_ids()
         self._check_invariants()
+
+    # ------------------------------------------------------------------
+    # authorization records
+    # ------------------------------------------------------------------
+
+    def _parse_authorization_records(self, raw: Any) -> dict[str, dict[str, Any]]:
+        """Validate authorization records and normalise their shape.
+
+        Shared by ``_install_fixture`` (seeded holds) and, from W6,
+        ``_install_full_export`` (restored holds) so both entry points agree on
+        what a well-formed record is. Balances come from ``self.balances``
+        because every other record already carries the new state.
+        """
+        if not isinstance(raw, list):
+            raise validation_error("'authorizations' must be a list", code="validation_failed")
+
+        balances = self.balances
+        now = datetime.now(timezone.utc)
+        parsed: dict[str, dict[str, Any]] = {}
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise validation_error("each authorization must be an object", code="validation_failed")
+            record = dict(entry)
+
+            auth_id = record.get("id") or record.get("authorization_id")
+            if not isinstance(auth_id, str) or not auth_id:
+                raise validation_error("each authorization needs an 'id'", code="validation_failed")
+            if auth_id in parsed:
+                raise validation_error(f"duplicate authorization id: {auth_id!r}", code="validation_failed")
+
+            status = record.get("status") or "open"
+            if status not in AUTHORIZATION_STATUSES:
+                raise validation_error(
+                    f"authorization {auth_id!r} has unknown status {status!r}", code="validation_failed"
+                )
+
+            amount = record.get("amount")
+            if isinstance(amount, bool) or not isinstance(amount, int) or amount <= 0:
+                raise validation_error(
+                    f"authorization {auth_id!r} needs a positive integer 'amount'",
+                    code="validation_failed",
+                    id=auth_id,
+                )
+
+            sender = record.get("from") or record.get("from_handle")
+            if not isinstance(sender, str) or sender not in balances:
+                raise validation_error(
+                    f"authorization {auth_id!r} references unknown user {sender!r}",
+                    code="unknown_user",
+                    id=auth_id,
+                )
+
+            recipient = record.get("to", record.get("to_handle"))
+            if recipient is not None and (
+                not isinstance(recipient, str) or recipient not in balances
+            ):
+                raise validation_error(
+                    f"authorization {auth_id!r} references unknown user {recipient!r}",
+                    code="unknown_user",
+                    id=auth_id,
+                )
+
+            captured = record.get("captured_amount") or 0
+            if isinstance(captured, bool) or not isinstance(captured, int) or captured < 0:
+                raise validation_error(
+                    f"authorization {auth_id!r} needs a non-negative integer 'captured_amount'",
+                    code="validation_failed",
+                    id=auth_id,
+                )
+            if captured > amount:
+                raise validation_error(
+                    f"authorization {auth_id!r} captured_amount {captured} exceeds amount {amount}",
+                    code="validation_failed",
+                    id=auth_id,
+                )
+
+            record["id"] = auth_id
+            record["status"] = status
+            record["amount"] = amount
+            record["from"] = sender
+            record["from_handle"] = sender
+            record["to"] = recipient
+            record["to_handle"] = recipient
+            record["captured_amount"] = captured
+            record["remaining_amount"] = amount - captured
+            record["payment_id"] = record.get("payment_id")
+            record["payment_ids"] = list(record.get("payment_ids") or [])
+            record["note"] = record.get("note")
+            record["created_at"] = record.get("created_at") or now.isoformat()
+            record["updated_at"] = record.get("updated_at") or record["created_at"]
+            if status in TERMINAL_AUTHORIZATION_STATUSES:
+                record.setdefault("closed_at", record["updated_at"])
+            parsed[auth_id] = record
+
+        # Seeded holds must fit inside the seeded balances, otherwise the fixture
+        # would install a world where available is already negative.
+        holds: dict[str, int] = {}
+        for record in parsed.values():
+            if authorization_open_at(record, now):
+                sender = record["from"]
+                holds[sender] = holds.get(sender, 0) + int(record["amount"])
+        for handle, held in holds.items():
+            balance = balances.get(handle, 0)
+            if held > balance:
+                raise validation_error(
+                    f"seeded authorizations hold {held} minor units for {handle!r} but the "
+                    f"seeded balance is only {balance}; available would be negative",
+                    code="validation_failed",
+                    handle=handle,
+                    held=held,
+                    balance=balance,
+                )
+
+        return parsed
+
+    def _sync_authorization_ids(self) -> None:
+        """Restart the id counter above any authorization id already in use."""
+        highest = 0
+        for auth_id in self.authorizations:
+            suffix = auth_id.rsplit("_", 1)[-1]
+            if suffix.isdigit():
+                highest = max(highest, int(suffix))
+        self._ids["authorization"] = itertools.count(highest + 1)
 
     def _export(self) -> dict[str, Any]:
         return {
@@ -281,6 +546,9 @@ class Store:
             "users": [dict(u) for u in self.users.values()],
             "balances": dict(self.balances),
             "requests": [dict(r) for r in self.requests.values()],
+            # stage-2: authorization records ride along with the snapshot, which
+            # is what makes the lazy-expiry transition observable from outside.
+            "authorizations": [dict(a) for a in self.authorizations.values()],
             "activity": [dict(a) for a in self.activity],
             "idempotency": [
                 {
@@ -411,19 +679,30 @@ class Store:
     # ------------------------------------------------------------------
 
     def transaction(self, fn: Callable[[], T]) -> T:
-        """Run ``fn`` under the lock, then re-assert I1-I4 before releasing.
+        """Run ``fn`` under the lock, then re-assert I1-I5 before releasing.
 
         If an invariant ever breaks the mutation is reported as a 500 rather
         than being committed silently. The lock is released via ``finally`` so
         a raising handler can never wedge the process.
+
+        The lazy-expiry sweep runs first, so every write observes overdue
+        authorizations and releases their holds before the mutation is applied.
         """
         with self.lock:
+            self._expire_authorizations()
             result = fn()
             self._check_invariants()
             return result
 
     def read(self, fn: Callable[[], T]) -> T:
+        """Run ``fn`` under the lock, applying lazy expiry first.
+
+        Expiry is a genuine state transition, so it happens on reads too: a
+        ``GET /me`` after an authorization lapsed must report the released
+        hold, not the stale one.
+        """
         with self.lock:
+            self._expire_authorizations()
             return fn()
 
     # ------------------------------------------------------------------

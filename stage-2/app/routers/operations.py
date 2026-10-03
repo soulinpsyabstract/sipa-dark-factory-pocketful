@@ -461,18 +461,22 @@ def create_split(body: SplitIn, request: Request, me: CurrentUser) -> JSONRespon
             for index, handle in enumerate(participants)
         ]
 
-        # Validate every debit before moving a single unit.
+        # Validate every debit before moving a single unit. Debits are measured
+        # against *available* (balance minus holds), so funds reserved by an open
+        # authorization cannot be spent, and this dry run agrees with what
+        # store._transfer will actually do - otherwise a hold could turn the
+        # second transfer into a mid-loop failure and leave a partial split.
         charged = 0
         for part in parts:
             if part["handle"] == me:
                 continue
-            available = store.balances.get(part["handle"], 0)
+            available = store._available_amount(part["handle"])
             if available < part["amount"]:
                 from ..errors import insufficient_funds
 
                 raise insufficient_funds(part["handle"], available, part["amount"])
             charged += part["amount"]
-        if store.balances.get(me, 0) < charged:
+        if store._available_amount(me) < charged:
             from ..errors import insufficient_funds
 
             raise insufficient_funds(me, store.balances.get(me, 0), charged)
@@ -604,14 +608,16 @@ def create_settlement(body: SettlementIn, request: Request, me: CurrentUser) -> 
             transfers.append({"from": sender, "to": receiver, "amount": entry.amount})
 
         # Dry run: balances are a plain dict, so snapshot, verify, then commit.
+        # Debits are checked against *available* so a hold makes the whole batch
+        # fail up front instead of part-way through, which would break atomicity.
         projected = dict(store.balances)
+        held = {h: store._held_amount(h) for h in set(projected) | set(store.users)}
         for transfer in transfers:
-            if projected.get(transfer["from"], 0) < transfer["amount"]:
+            free = projected.get(transfer["from"], 0) - held.get(transfer["from"], 0)
+            if free < transfer["amount"]:
                 from ..errors import insufficient_funds
 
-                raise insufficient_funds(
-                    transfer["from"], projected.get(transfer["from"], 0), transfer["amount"]
-                )
+                raise insufficient_funds(transfer["from"], free, transfer["amount"])
             projected[transfer["from"]] -= transfer["amount"]
             projected[transfer["to"]] = projected.get(transfer["to"], 0) + transfer["amount"]
 
