@@ -1,0 +1,10 @@
+# Builder-local artefacts only. Nothing here belongs in the stage-2 commit.
+#
+# Deliberately scoped to stage-2/ rather than the repo-root .gitignore, so the
+# stage-2 work stays self-contained and no root file is touched.
+.venv/
+build.err
+build.log
+__pycache__/
+.pytest_cache/
+*.pyc
