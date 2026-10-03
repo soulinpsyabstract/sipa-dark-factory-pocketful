@@ -71,3 +71,19 @@ verifier accepted both after re-running the mutation test.
 3. `python -m harness run --track pocketful --repo <this repo> --stage N` to check a stage
    locally before judging; `python -m harness check --track pocketful <this repo>` for the
    structure, mandate and credential checks.
+
+## Earlier attempt (not part of the submitted run)
+
+On 2026-09-27/28 a first Stage 1 attempt ran on the team's own server, with two seats as
+Hermes agent profiles and a third seat as a separate daemon, in a different BAND room from
+the one exported in `room.json`. That room is not included in `room.json`. Its verifier
+reported on its own harness runs that the service passed 135 of 147 shipped Stage 1
+checks at first (later stored runs on the same server: 140, then 145 of 147), and found
+that the service crashed on invalid query parameters instead of returning a validation
+error. Commit `1aa413b` ("Add Stage 1 Pocketful implementation") comes from that attempt.
+
+None of that implementation survives in the submitted tree: `app.py`, `server.js`,
+`package.json` and `pyproject.toml` are gone, and `Dockerfile` and `RUN.md` were rewritten.
+The Stage 1 code in `stage-1/` was written in the second room (OpenCode seats, see Seats
+above) and accepted there at `48684e8`. The earlier commit stays in the history because the
+history was not rewritten.
