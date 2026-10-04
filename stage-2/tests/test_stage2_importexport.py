@@ -13,6 +13,7 @@ In-process via ``TestClient``.
 from __future__ import annotations
 
 import copy
+import json
 import os
 import sys
 
@@ -126,12 +127,29 @@ def test_every_session_survives_not_just_one(client):
     assert client.get("/me", headers=auth(bob)).status_code == 200
 
 
-def test_a_token_naming_an_absent_user_is_refused(client):
+def test_a_tokens_key_in_the_payload_is_ignored_not_honoured(client):
+    """A legacy export carrying `tokens` must not be able to mint a session.
+
+    Stage-2 exports no longer contain tokens, but an export taken by an earlier
+    stage-2 build does. Importing one must not restore a session from it: a
+    payload-supplied token is an assertion about authentication, and honouring it
+    would let any holder of an old export file authenticate as any handle they
+    name. Sessions come from the server's own table only.
+    """
+    ada = login(client, "ada")
     payload = export(client)
-    payload["tokens"].append({"token": "ghost-token", "handle": "nobody"})
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-    assert r.json()["code"] == "unknown_user", r.text
+    payload["tokens"] = [
+        {"token": "forged-token", "handle": "ada"},
+        {"token": "ghost-token", "handle": "nobody"},
+    ]
+    assert do_import(client, payload).status_code == 200
+
+    forged = client.get("/me", headers=auth("forged-token"))
+    assert forged.status_code == 401, "a token from the payload was honoured"
+    ghost = client.get("/me", headers=auth("ghost-token"))
+    assert ghost.status_code == 401, "a payload token for an absent user was honoured"
+    # And the genuinely live session still works.
+    assert client.get("/me", headers=auth(ada)).status_code == 200
 
 
 # ----------------------------------------------------------------------
@@ -343,11 +361,32 @@ def test_export_import_export_round_trips_each_field(client, field):
     assert second[field] == first[field], f"{field} did not round-trip"
 
 
-def test_tokens_round_trip(client):
-    login(client, "ada")
-    first = export(client)
-    do_import(client, first)
-    assert export(client)["tokens"] == first["tokens"]
+def test_the_export_carries_no_tokens_and_no_bearer_token_anywhere(client):
+    """Amended D3, leg (a): the export is not a credential-bearing file.
+
+    Two separate assertions. The structural one is that there is no ``tokens``
+    key. The stronger one is that no live bearer token appears anywhere in the
+    serialised payload - a structural check alone would still pass if a token
+    leaked into, say, the activity rows or a payment body.
+    """
+    ada = login(client, "ada")
+    login(client, "bob")
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(ada, "k1"),
+    )
+    client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(ada, "p1"))
+
+    snap = export(client)
+    assert "tokens" not in snap, "the export still carries a tokens key"
+
+    body = json.dumps(snap)
+    assert ada not in body, "a live bearer token appears in the export"
+    assert "tokens" not in body
+
+    # And the session is unaffected by having exported it.
+    assert client.get("/me", headers=auth(ada)).status_code == 200
 
 
 def test_invariants_hold_after_import(client):
@@ -382,11 +421,14 @@ def _busy_world(client):
 def _state(client):
     """Snapshot for "a rejected import changes nothing".
 
-    The buckets that carry authority - ``authorizations`` and ``tokens`` - are
+    The buckets that carry authority - ``authorizations`` above all - are
     compared by value, not by length. A count would pass while a hold or a live
     session was silently rewritten, which is precisely the W5 defect shape:
     import dropped every authorization, so a count could stay right while the
     hold itself vanished.
+
+    Sessions are not in the export at all any more, so they are checked
+    behaviourally by ``test_a_rejected_import_leaves_live_sessions_working``.
     """
     snap = export(client)
     return {
@@ -395,7 +437,6 @@ def _state(client):
         "authorizations": snap["authorizations"],
         "activity": snap["activity"],
         "idempotency": snap["idempotency"],
-        "tokens": snap["tokens"],
     }
 
 
@@ -408,10 +449,11 @@ def _state(client):
         pytest.param(lambda p: p["idempotency"].append({"user": "ghost", "key": "k", "status_code": 200, "body": {}}), id="idempotency-unknown-user"),
         pytest.param(lambda p: p["authorizations"].append({"id": "a_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}), id="authorization-unknown-user"),
         pytest.param(lambda p: p["authorizations"].append({"id": "a_x", "from": "ada", "to": "bob", "amount": 1, "status": "teleported"}), id="authorization-unknown-status"),
-        pytest.param(lambda p: p["tokens"].append({"token": "t_x", "handle": "ghost"}), id="token-unknown-user"),
+        
         pytest.param(lambda p: p.__setitem__("requests", "not-a-list"), id="requests-not-a-list"),
         pytest.param(lambda p: p.__setitem__("authorizations", {"nope": 1}), id="authorizations-not-a-list"),
-        pytest.param(lambda p: p.__setitem__("tokens", 7), id="tokens-not-a-list"),
+        pytest.param(lambda p: p.__setitem__("activity", 7), id="activity-not-a-list"),
+        pytest.param(lambda p: p.__setitem__("idempotency", "nope"), id="idempotency-not-a-list"),
     ],
 )
 def test_a_rejected_import_changes_nothing(client, poison):
@@ -430,6 +472,38 @@ def test_a_rejected_import_changes_nothing(client, poison):
     assert _state(client) == before
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="known gap: imported request 'amount' is unvalidated; Core owns the scoping call",
+)
+def test_a_rejected_import_changes_nothing_known_gap_request_amount(client):
+    """KNOWN GAP, tracked not hidden: an imported request ``amount`` is unvalidated.
+
+    ``status`` and both handles of an imported pending request are re-validated
+    against the seeded user set, but ``amount`` is not - not for type, not for
+    sign, not even for presence. A crafted export can therefore inject a pending
+    request carrying a negative or non-numeric amount.
+
+    This is *not* a session or authorization defect, and it is out of the scope
+    of the amended D3 clause, so it is recorded here as a failing-by-design test
+    rather than fixed silently inside a gate-bound commit. Core owns the scoping
+    call; this test flips to passing the moment the validator checks amount.
+
+    Impact is limited by the fact that import is a test-only admin surface and
+    the balance invariants still hold, but "the validator checks two of three
+    fields" is an inconsistency worth closing.
+    """
+    payload = export(client)
+    payload["requests"].append(
+        {"id": "r_x", "from": "ada", "to": "bob", "status": "open", "amount": -5}
+    )
+    r = do_import(client, payload)
+    assert r.status_code == 422, (
+        "import accepted a request with a negative amount; the validator should "
+        "reject it. If this now fails, close the gap and delete this test."
+    )
+
+
 def test_a_rejected_import_leaves_the_session_working(client):
     token = _busy_world(client)
     payload = export(client)
@@ -444,7 +518,9 @@ def test_a_rejected_import_leaves_the_world_usable(client):
     """After a rejected import the store must still pass its own invariants."""
     _busy_world(client)
     payload = export(client)
-    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+    payload["requests"].append(
+        {"id": "r_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}
+    )
     assert do_import(client, payload).status_code == 422
 
     r = client.post(
@@ -478,31 +554,49 @@ def _stable(snap):
     return {k: v for k, v in snap.items() if k != "exported_at"}
 
 
-def test_a_rejected_import_leaves_tokens_and_authorizations_byte_identical(client):
+def test_a_rejected_import_leaves_sessions_and_authorizations_byte_identical(client):
     """A 422 must not touch the buckets that carry authority.
 
-    Asserted by value rather than by count: a hold or a session can be rewritten
-    without changing how many there are.
+    Asserted by value rather than by count: a hold can be rewritten without
+    changing how many there are.
+
+    Sessions are not in the export any more, so "byte-identical" is checked
+    against the server's own token table - the exact token strings minted before
+    the failed import must still authenticate, which is only true if the table
+    was never rewritten.
     """
     _busy_world(client)
     before = _state(client)
     assert before["authorizations"], "needs a populated world to be meaningful"
-    assert before["tokens"], "needs a live session to be meaningful"
+
+    # Capture the live token strings by value, before anything is attempted.
+    live = {"ada": login(client, "ada"), "bob": login(client, "bob")}
+    assert all(
+        client.get("/me", headers=auth(tok)).status_code == 200 for tok in live.values()
+    ), "needs live sessions to be meaningful"
 
     payload = export(client)
     # Move the money first, so a partial write that lands before validation
     # fails would be unmistakable in the balances too.
     payload["balances"] = {"ada": 1111, "bob": 889, "cyd": 0}
-    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+    payload["requests"].append(
+        {"id": "r_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}
+    )
 
     assert do_import(client, payload).status_code == 422
 
     after = _state(client)
-    assert after["tokens"] == before["tokens"], "tokens were rewritten by a rejected import"
     assert after["authorizations"] == before["authorizations"], (
         "authorizations were rewritten by a rejected import"
     )
     assert after == before
+
+    # The same token strings, still working: the table was preserved, not
+    # rebuilt with fresh tokens.
+    for handle, tok in live.items():
+        r = client.get("/me", headers=auth(tok))
+        assert r.status_code == 200, f"{handle}'s live session did not survive the 422"
+        assert r.json()["handle"] == handle
 
 
 def test_export_import_export_reaches_a_fixed_point(client):
@@ -556,14 +650,12 @@ def test_importing_the_same_export_twice_never_releases_a_hold(client):
 
 
 def test_a_live_session_for_a_user_the_import_removes_is_dropped(client):
-    """The security leg: an import must not leave a removed user signed in.
+    """Amended D3, leg (c): an import must not leave a removed user signed in.
 
-    A token that was already live in the daemon, for a handle the imported
-    payload does not contain, must stop working. If it survives, an import that
-    deprovisions a user leaves them authenticated - an authentication bypass.
-
-    Seeded from a full stage-2 export so the payload's own ``tokens`` list is
-    the authority, which is the stricter of the two shapes.
+    A token that was *already live in the daemon* - never carried in the payload,
+    because the export does not carry tokens - for a handle the imported payload
+    does not contain, must stop working. If it survives, an import that
+    deprovisions a user leaves them authenticated: an authentication bypass.
     """
     ada = login(client, "ada")
     bob = login(client, "bob")
@@ -573,7 +665,6 @@ def test_a_live_session_for_a_user_the_import_removes_is_dropped(client):
     payload["users"] = [u for u in payload["users"] if u.get("handle") != "ada"]
     payload["balances"] = {"bob": 0}
     payload["seeded_total"] = 0
-    payload["tokens"] = [t for t in payload["tokens"] if t.get("handle") != "ada"]
     payload["authorizations"] = []
 
     assert do_import(client, payload).status_code == 200
@@ -586,41 +677,38 @@ def test_a_live_session_for_a_user_the_import_removes_is_dropped(client):
     )
 
 
-def test_a_live_session_for_a_removed_user_is_dropped_without_a_token_key(client):
-    """Same rule when the payload carries no ``tokens`` key at all.
+def test_a_live_session_for_a_removed_user_is_dropped_from_a_stage1_shaped_payload(client):
+    """Same rule from the other payload shape.
 
-    A bare fixture has no session list to restore. It also takes the reset
-    path, which Core's ruling deliberately left token-free
-    (``test_reset_still_wipes_tokens``), so no preservation is claimed here for
-    surviving handles either - the point of this test is only the security
-    property: a handle the import removes must not stay signed in.
-
-    Preservation for surviving handles is asserted where it does apply, in
-    ``test_a_stage1_shaped_export_preserves_live_sessions`` - a stage-1 export
-    takes the full-export path despite carrying no ``tokens``.
+    A stage-1 export cannot even express authorizations, let alone sessions. It
+    still takes the full-export path, and a handle it removes must not stay
+    signed in. Bare fixtures are the one exception - they take the reset path
+    and start token-free by design (``test_reset_still_wipes_tokens``).
     """
     ada = login(client, "ada")
     login(client, "bob")
 
     payload = {
-        "users": [{"handle": "bob", "email": "bob@example.com", "balance": 500, "password": PW}],
+        "users": [
+            {"handle": "bob", "email": "bob@example.com", "balance": 500, "password": PW}
+        ],
         "balances": {"bob": 500},
         "seeded_total": 500,
     }
     assert do_import(client, payload).status_code == 200
 
     assert client.get("/me", headers=auth(ada)).status_code == 401, (
-        "a deprovisioned user's session survived an import with no tokens key"
+        "a deprovisioned user's session survived a stage-1 shaped import"
     )
 
 
 def test_a_stage1_shaped_export_preserves_live_sessions(client):
-    """Core's D3 ruling: a stage-1 export has no ``tokens`` field.
+    """Amended D3: every export is session-free, so preservation is the rule.
 
-    Its format simply cannot express sessions, so wiping every live session
-    would break the very requirement SPEC.md line 151 states - a browser signed
-    in before the upgrade must stay signed in afterwards. Sessions for surviving
-    handles are therefore preserved.
+    With no ``tokens`` key in any payload there is nothing to restore, and the
+    server's own token table is the authority. Wiping it would break SPEC.md line
+    151 outright - a browser signed in before the upgrade must still be signed in
+    afterwards - so sessions for surviving handles are preserved.
     """
     ada = login(client, "ada")
     bob = login(client, "bob")
@@ -635,27 +723,15 @@ def test_a_stage1_shaped_export_preserves_live_sessions(client):
     assert client.get("/me", headers=auth(bob)).status_code == 200
 
 
-def test_an_explicitly_empty_token_list_is_authoritative(client):
-    """``"tokens": []`` means "nobody was signed in", not "keep what is live".
-
-    Key presence, not truthiness, decides. If emptiness were treated as absence
-    then a full export taken with nobody signed in would silently re-admit every
-    session that happened to be live at import time.
-    """
-    ada = login(client, "ada")
-    payload = export(client)
-    payload["tokens"] = []
-    assert do_import(client, payload).status_code == 200
-    assert client.get("/me", headers=auth(ada)).status_code == 401
-
-
 def test_a_rejected_import_leaves_live_sessions_working(client):
     """Rollback must restore the session table, not just the balances."""
     ada = login(client, "ada")
     bob = login(client, "bob")
 
     payload = export(client)
-    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+    payload["requests"].append(
+        {"id": "r_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}
+    )
     assert do_import(client, payload).status_code == 422
 
     assert client.get("/me", headers=auth(ada)).status_code == 200

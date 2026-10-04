@@ -755,13 +755,18 @@ class Store:
                 }
                 for key, rec in self.idempotency.items()
             ],
-            # Sessions are part of the snapshot: the spec requires a browser
-            # signed in before an export/import upgrade to still be signed in
-            # afterwards, so the live tokens have to travel with the state.
-            "tokens": [
-                {"token": token, "handle": handle}
-                for token, handle in self.tokens.items()
-            ],
+            # Deliberately NOT here: the live bearer tokens.
+            #
+            # SPEC.md line 151 requires that "a browser signed in before that
+            # export/import upgrade must remain signed in afterwards", but read
+            # the wording: that is an in-place upgrade on the same server, not a
+            # session migration to another host. The server's own token table
+            # survives an import, so the tokens never need to travel. Putting
+            # them in the payload would satisfy the same requirement while
+            # turning every export into a directly credential-bearing file -
+            # strictly worse than stage 1, whose export held only bcrypt hashes
+            # that cannot be used to authenticate. See
+            # ``_install_full_export`` for how sessions are preserved instead.
             "balance_sum": sum(self.balances.values()),
             "invariants": self.invariant_report(),
         }
@@ -963,51 +968,30 @@ class Store:
             restored_auth[auth_id] = record
         self.authorizations = restored_auth
 
-        # Sessions travel with the snapshot so a browser signed in before the
-        # upgrade is still signed in afterwards (SPEC.md, "Existing clients after
-        # an upgrade"). Two payload shapes have to be treated differently:
+        # Sessions are preserved server-side, never through the payload.
         #
-        # * A stage-2 export carries an explicit ``tokens`` list. That list is
-        #   authoritative - *including when it is empty*, because emptiness is
-        #   the snapshot of "nobody was signed in at export time". A token in it
-        #   naming an absent handle is refused 422 rather than dropped: the
-        #   payload is asserting a login the import was never handed, which is a
-        #   malformed export, not a session to discard.
-        # * A stage-1 export carries no ``tokens`` key at all - its format has no
-        #   such field. There is nothing to restore, so live sessions are
-        #   preserved for the handles the import keeps.
+        # The export carries no `tokens`, so there is nothing to restore and
+        # nothing to validate: the live table is simply kept for the handles this
+        # import retains, and dropped for every handle it removes.
         #
-        # In both shapes a live token whose handle the import *removes* is
-        # dropped. Keeping it would leave a deprovisioned user authenticated
-        # after an import, which is an authentication bypass and not a
-        # session-preservation nicety - so preservation is scoped to surviving
-        # handles, never to the session table as a whole.
-        raw_tokens = payload.get("tokens")
-        if raw_tokens is None:
-            candidates: list[Any] = [
-                {"token": token, "handle": handle}
-                for token, handle in (live_tokens or {}).items()
-                if handle in self.users
-            ]
-        else:
-            if not isinstance(raw_tokens, list):
-                raise validation_error("export 'tokens' must be a list")
-            candidates = raw_tokens
-
-        restored_tokens: dict[str, str] = {}
-        for record in candidates:
-            if not isinstance(record, dict):
-                raise validation_error("each exported token must be an object")
-            token, handle = record.get("token"), record.get("handle")
-            if not isinstance(token, str) or not token:
-                raise validation_error("each exported token needs a 'token'")
-            if not isinstance(handle, str) or handle not in self.users:
-                raise validation_error(
-                    f"exported token references unknown user {handle!r}",
-                    code="unknown_user",
-                )
-            restored_tokens[token] = handle
-        self.tokens = restored_tokens
+        # Keeping a dropped handle's session would be an authentication bypass -
+        # an import that deprovisions a user must leave them signed out - so
+        # preservation is scoped to surviving handles, never to the table as a
+        # whole.
+        #
+        # SPEC.md line 151 is satisfied by this: "a browser signed in before that
+        # export/import upgrade must remain signed in afterwards" describes an
+        # in-place upgrade on the same server, and this is the same server, so
+        # its own sessions are still valid afterwards.
+        #
+        # A `tokens` key in the payload is ignored rather than honoured, so a
+        # legacy stage-2 export cannot smuggle a session onto a handle the
+        # import did not preserve, and cannot resurrect a deprovisioned user.
+        self.tokens = {
+            token: handle
+            for token, handle in (live_tokens or {}).items()
+            if handle in self.users
+        }
 
         # A restored snapshot must still satisfy every invariant.
         self._check_invariants()
