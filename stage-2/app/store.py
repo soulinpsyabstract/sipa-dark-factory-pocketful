@@ -828,7 +828,7 @@ class Store:
         saved = self._capture_state()
         try:
             if is_full_export:
-                return self._install_full_export(payload)
+                return self._install_full_export(payload, saved.get("tokens") or {})
 
             if "users" in payload or "balances" in payload or "seeded_total" in payload or "total" in payload:
                 self._install_fixture(payload)
@@ -842,8 +842,15 @@ class Store:
         )
 
 
-    def _install_full_export(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Restore a snapshot verbatim. Seed users first, then overlay the rest."""
+    def _install_full_export(
+        self, payload: dict[str, Any], live_tokens: dict[str, str] | None = None
+    ) -> dict[str, Any]:
+        """Restore a snapshot verbatim. Seed users first, then overlay the rest.
+
+        ``live_tokens`` is the session table as it stood *before* the import,
+        captured by ``_import``. ``_install_fixture`` clears it, so it has to be
+        handed in rather than read back off ``self``.
+        """
         self._install_fixture(
             {
                 "users": payload.get("users", []),
@@ -956,14 +963,39 @@ class Store:
             restored_auth[auth_id] = record
         self.authorizations = restored_auth
 
-        # Sessions travel with the snapshot so a signed-in browser stays signed
-        # in. Only tokens naming a restored user are honoured; a token for an
-        # absent handle is dropped rather than resurrecting a phantom login.
-        tokens_payload = payload.get("tokens") or []
-        if not isinstance(tokens_payload, list):
-            raise validation_error("export 'tokens' must be a list")
+        # Sessions travel with the snapshot so a browser signed in before the
+        # upgrade is still signed in afterwards (SPEC.md, "Existing clients after
+        # an upgrade"). Two payload shapes have to be treated differently:
+        #
+        # * A stage-2 export carries an explicit ``tokens`` list. That list is
+        #   authoritative - *including when it is empty*, because emptiness is
+        #   the snapshot of "nobody was signed in at export time". A token in it
+        #   naming an absent handle is refused 422 rather than dropped: the
+        #   payload is asserting a login the import was never handed, which is a
+        #   malformed export, not a session to discard.
+        # * A stage-1 export carries no ``tokens`` key at all - its format has no
+        #   such field. There is nothing to restore, so live sessions are
+        #   preserved for the handles the import keeps.
+        #
+        # In both shapes a live token whose handle the import *removes* is
+        # dropped. Keeping it would leave a deprovisioned user authenticated
+        # after an import, which is an authentication bypass and not a
+        # session-preservation nicety - so preservation is scoped to surviving
+        # handles, never to the session table as a whole.
+        raw_tokens = payload.get("tokens")
+        if raw_tokens is None:
+            candidates: list[Any] = [
+                {"token": token, "handle": handle}
+                for token, handle in (live_tokens or {}).items()
+                if handle in self.users
+            ]
+        else:
+            if not isinstance(raw_tokens, list):
+                raise validation_error("export 'tokens' must be a list")
+            candidates = raw_tokens
+
         restored_tokens: dict[str, str] = {}
-        for record in tokens_payload:
+        for record in candidates:
             if not isinstance(record, dict):
                 raise validation_error("each exported token must be an object")
             token, handle = record.get("token"), record.get("handle")

@@ -548,3 +548,115 @@ def test_importing_the_same_export_twice_never_releases_a_hold(client):
     )
     assert r.status_code == 422, r.text
     assert r.json()["code"] == "insufficient_funds", r.text
+
+
+# ----------------------------------------------------------------------
+# session scope on import: preserve survivors, drop the deprovisioned
+# ----------------------------------------------------------------------
+
+
+def test_a_live_session_for_a_user_the_import_removes_is_dropped(client):
+    """The security leg: an import must not leave a removed user signed in.
+
+    A token that was already live in the daemon, for a handle the imported
+    payload does not contain, must stop working. If it survives, an import that
+    deprovisions a user leaves them authenticated - an authentication bypass.
+
+    Seeded from a full stage-2 export so the payload's own ``tokens`` list is
+    the authority, which is the stricter of the two shapes.
+    """
+    ada = login(client, "ada")
+    bob = login(client, "bob")
+    assert client.get("/me", headers=auth(ada)).status_code == 200
+
+    payload = export(client)
+    payload["users"] = [u for u in payload["users"] if u.get("handle") != "ada"]
+    payload["balances"] = {"bob": 0}
+    payload["seeded_total"] = 0
+    payload["tokens"] = [t for t in payload["tokens"] if t.get("handle") != "ada"]
+    payload["authorizations"] = []
+
+    assert do_import(client, payload).status_code == 200
+
+    assert client.get("/me", headers=auth(ada)).status_code == 401, (
+        "a deprovisioned user's session survived the import - auth bypass"
+    )
+    assert client.get("/me", headers=auth(bob)).status_code == 200, (
+        "a surviving user's session was dropped needlessly"
+    )
+
+
+def test_a_live_session_for_a_removed_user_is_dropped_without_a_token_key(client):
+    """Same rule when the payload carries no ``tokens`` key at all.
+
+    A bare fixture has no session list to restore. It also takes the reset
+    path, which Core's ruling deliberately left token-free
+    (``test_reset_still_wipes_tokens``), so no preservation is claimed here for
+    surviving handles either - the point of this test is only the security
+    property: a handle the import removes must not stay signed in.
+
+    Preservation for surviving handles is asserted where it does apply, in
+    ``test_a_stage1_shaped_export_preserves_live_sessions`` - a stage-1 export
+    takes the full-export path despite carrying no ``tokens``.
+    """
+    ada = login(client, "ada")
+    login(client, "bob")
+
+    payload = {
+        "users": [{"handle": "bob", "email": "bob@example.com", "balance": 500, "password": PW}],
+        "balances": {"bob": 500},
+        "seeded_total": 500,
+    }
+    assert do_import(client, payload).status_code == 200
+
+    assert client.get("/me", headers=auth(ada)).status_code == 401, (
+        "a deprovisioned user's session survived an import with no tokens key"
+    )
+
+
+def test_a_stage1_shaped_export_preserves_live_sessions(client):
+    """Core's D3 ruling: a stage-1 export has no ``tokens`` field.
+
+    Its format simply cannot express sessions, so wiping every live session
+    would break the very requirement SPEC.md line 151 states - a browser signed
+    in before the upgrade must stay signed in afterwards. Sessions for surviving
+    handles are therefore preserved.
+    """
+    ada = login(client, "ada")
+    bob = login(client, "bob")
+
+    payload = dict(STAGE1_EXPORT)
+    assert "tokens" not in payload
+    assert do_import(client, payload).status_code == 200
+
+    assert client.get("/me", headers=auth(ada)).status_code == 200, (
+        "a stage-1 export wiped a live session; SPEC.md line 151 forbids that"
+    )
+    assert client.get("/me", headers=auth(bob)).status_code == 200
+
+
+def test_an_explicitly_empty_token_list_is_authoritative(client):
+    """``"tokens": []`` means "nobody was signed in", not "keep what is live".
+
+    Key presence, not truthiness, decides. If emptiness were treated as absence
+    then a full export taken with nobody signed in would silently re-admit every
+    session that happened to be live at import time.
+    """
+    ada = login(client, "ada")
+    payload = export(client)
+    payload["tokens"] = []
+    assert do_import(client, payload).status_code == 200
+    assert client.get("/me", headers=auth(ada)).status_code == 401
+
+
+def test_a_rejected_import_leaves_live_sessions_working(client):
+    """Rollback must restore the session table, not just the balances."""
+    ada = login(client, "ada")
+    bob = login(client, "bob")
+
+    payload = export(client)
+    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+    assert do_import(client, payload).status_code == 422
+
+    assert client.get("/me", headers=auth(ada)).status_code == 200
+    assert client.get("/me", headers=auth(bob)).status_code == 200
