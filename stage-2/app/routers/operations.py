@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 from ..dependencies import get_current_user, require_operator, store
 from ..errors import AppError, conflict, forbidden, not_found, validation_error
 from ..schemas import PaymentIn, RequestIn, SettlementIn, SplitIn
-from ..store import REQUEST_STATUSES, is_valid_handle, now_iso
+from ..store import MAX_LIST_LIMIT, REQUEST_STATUSES, is_valid_handle, now_iso
 
 router = APIRouter()
 
@@ -111,6 +111,11 @@ def create_payment(
                 "amount": body.amount,
                 "note": body.message,
                 "created_at": now_iso(),
+                # stage-2 (D4): additive and null here, so a payment made
+                # without an authorization is distinguishable from a capture.
+                # Existing Stage-1 keys above are untouched.
+                "authorization_id": None,
+                "request_id": None,
                 "balances": {me: store.balances[me], to: store.balances[to]},
                 "balance_sum": sum(store.balances.values()),
                 "seeded_total": store.seeded_total,
@@ -361,7 +366,7 @@ def list_requests(
     me: CurrentUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
-    limit: int = Query(default=1000, ge=1, le=1000),
+    limit: int | None = Query(default=None, ge=1, le=MAX_LIST_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> JSONResponse:
     """List the caller's requests.
@@ -372,8 +377,10 @@ def list_requests(
     Anything else -> 422.
 
     ``limit``/``offset``/``has_more`` are additive and mirror
-    ``GET /authorizations``; the defaults leave an unfiltered Stage-1 request
-    untruncated.
+    ``GET /authorizations``. ``limit`` defaults to *unbounded* on purpose: the
+    accepted Stage-1 contract never truncated this list, so truncation has to be
+    something a caller opts into. Passing ``limit`` paginates and sets
+    ``has_more``.
     """
     direction = direction.strip().lower()
     if direction not in ("incoming", "outgoing", "all"):
@@ -411,7 +418,8 @@ def list_requests(
             )
         items.sort(key=lambda r: r["id"], reverse=True)
         total = len(items)
-        items = items[offset : offset + limit]
+        # No limit means no truncation, matching Stage-1.
+        items = items[offset:] if limit is None else items[offset : offset + limit]
         return {
             "status": "ok",
             "requests": items,

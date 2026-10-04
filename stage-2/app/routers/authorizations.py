@@ -12,6 +12,8 @@ the spec pins ``422 validation_failed`` for a bad ``amount``/``note``/
 from __future__ import annotations
 
 import hashlib
+import json
+from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -25,18 +27,20 @@ from ..store import (
     AUTHORIZATION_VISIBILITIES,
     MAX_AUTHORIZATION_AMOUNT,
     MAX_AUTHORIZATION_NOTE_CHARS,
+    MAX_LIST_LIMIT,
     MIN_AUTHORIZATION_AMOUNT,
+    authorization_remaining,
     is_valid_handle,
+    now_iso,
+    parse_iso,
 )
 
 router = APIRouter()
 
 CurrentUser = Annotated[str, Depends(get_current_user)]
 
-#: Pagination defaults shared with ``GET /requests``. The default limit is large
-#: enough that an unfiltered Stage-1 style request is never silently truncated.
-DEFAULT_PAGE_LIMIT = 1000
-MAX_PAGE_LIMIT = 1000
+#: ``limit``/``offset`` behave identically on ``GET /requests`` and
+#: ``GET /authorizations``. ``MAX_LIST_LIMIT`` is shared with operations.py.
 
 
 async def raw_body(request: Request) -> bytes:
@@ -99,6 +103,53 @@ def validate_amount(value: Any) -> int:
     return value
 
 
+def parse_capture_body(raw: bytes) -> dict[str, Any]:
+    """Decode a capture body into ``{"amount": int|None, "final": bool}``.
+
+    Parsed by hand rather than through a pydantic model so a bad ``amount``
+    surfaces as the spec's ``422 validation_failed`` instead of the shared
+    ``validation_error``, and so ``{}`` fingerprints as a distinct request from
+    ``{"amount": n}`` (D6) while still meaning the same capture.
+    """
+    if not raw or not raw.strip():
+        return {"amount": None, "final": True}
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise validation_error(
+            f"request body must be valid JSON: {exc}", code="validation_failed", field="body"
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise validation_error(
+            "capture body must be a JSON object", code="validation_failed", field="body"
+        )
+
+    unknown = set(decoded) - {"amount", "final"}
+    if unknown:
+        raise validation_error(
+            "unknown capture field(s): " + ", ".join(sorted(unknown)),
+            code="validation_failed",
+            field="body",
+        )
+
+    amount = decoded.get("amount")
+    # bool is an int subclass; an explicit bool amount is never a valid amount.
+    if amount is not None and (isinstance(amount, bool) or not isinstance(amount, int)):
+        raise validation_error(
+            "amount must be an integer number of minor units",
+            code="validation_failed",
+            field="amount",
+        )
+
+    final = decoded.get("final", True)
+    if not isinstance(final, bool):
+        raise validation_error(
+            "final must be a boolean", code="validation_failed", field="final"
+        )
+
+    return {"amount": amount, "final": final}
+
+
 def validate_note(value: Any) -> str | None:
     if value is None:
         return None
@@ -152,7 +203,7 @@ def list_authorizations(
     me: CurrentUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
-    limit: int = Query(default=DEFAULT_PAGE_LIMIT, ge=1, le=MAX_PAGE_LIMIT),
+    limit: int | None = Query(default=None, ge=1, le=MAX_LIST_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> JSONResponse:
     """Authorizations where the caller is the payer or the receiver, and no others.
@@ -199,7 +250,7 @@ def list_authorizations(
         matched.sort(key=lambda r: (r.get("created_at") or "", r.get("id") or ""), reverse=True)
 
         total = len(matched)
-        page = matched[offset : offset + limit]
+        page = matched[offset:] if limit is None else matched[offset : offset + limit]
         items = [
             {
                 **store.authorization_public(record),
@@ -258,6 +309,157 @@ def get_authorization(authorization_id: str, me: CurrentUser) -> JSONResponse:
             "from_funds": funds,
         },
     )
+
+
+@router.post("/authorizations/{authorization_id}/capture")
+def capture_authorization(
+    authorization_id: str, request: Request, raw: RawBody, me: CurrentUser
+) -> JSONResponse:
+    """Move held funds to the receiver and return the created payment.
+
+    Only the receiver captures. ``amount`` defaults to the uncaptured
+    remainder. ``final`` defaults to ``true``: a final capture closes the
+    authorization and releases the uncaptured remainder in the same step, while
+    ``final: false`` keeps the remainder held for further captures.
+    """
+    key = required_idempotency_key(request)
+    print_id = fingerprint("POST", f"/authorizations/{authorization_id}/capture", raw)
+
+    body = parse_capture_body(raw)
+    final = body["final"]
+
+    def work() -> tuple[int, dict[str, Any]]:
+        replay = store._idem_replay(me, key, print_id)
+        if replay is not None:
+            return replay
+
+        record = store.authorizations.get(authorization_id)
+        if record is None:
+            raise not_found(
+                f"no such authorization: {authorization_id!r}",
+                code="not_found",
+                authorization_id=authorization_id,
+            )
+        if record.get("to") != me:
+            # 403 for the payer and for bystanders alike, per the spec.
+            raise AppError(
+                403,
+                "forbidden",
+                "only the receiver of an authorization may capture it",
+                id=authorization_id,
+                handle=me,
+            )
+
+        now = datetime.now(timezone.utc)
+        expires_at = parse_iso(record.get("expires_at"))
+        overdue = expires_at is not None and expires_at <= now
+        status_now = record.get("status")
+        # ``expired`` is reported as its own code whether the clock got there on
+        # this request or on an earlier lazy sweep, so the answer does not depend
+        # on request history. Only captured/voided are "not open".
+        if status_now == "expired" or (status_now == "open" and overdue):
+            store._expire_authorizations(now)
+            raise AppError(
+                409,
+                "authorization_expired",
+                f"authorization {authorization_id!r} expired at {record.get('expires_at')}",
+                id=authorization_id,
+                expires_at=record.get("expires_at"),
+            )
+        if status_now != "open":
+            raise AppError(
+                409,
+                "authorization_not_open",
+                f"authorization {authorization_id!r} is {status_now!r}, only an 'open' one can be captured",
+                id=authorization_id,
+                status=status_now,
+            )
+        store._expire_authorizations(now)
+
+        remaining = authorization_remaining(record)
+        amount = body["amount"] if body["amount"] is not None else remaining
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1:
+            raise validation_error(
+                "capture amount must be an integer of at least 1 minor unit",
+                code="validation_failed",
+                id=authorization_id,
+                amount=body["amount"],
+            )
+        if amount > remaining:
+            raise validation_error(
+                f"capture of {amount} exceeds the {remaining} still uncaptured",
+                code="capture_exceeds_authorization",
+                id=authorization_id,
+                amount=amount,
+                remaining=remaining,
+            )
+
+        payer, receiver = record["from"], record["to"]
+        store._transfer_from_hold(payer, receiver, amount)
+
+        captured = int(record.get("captured_amount") or 0) + amount
+        left = remaining - amount
+        closed = bool(final) or left == 0
+        moment = now_iso()
+        record["captured_amount"] = captured
+        record["updated_at"] = moment
+        if closed:
+            record["status"] = "captured"
+            record["closed_at"] = moment
+        # Derived after the status settles: a closed record reads zero even
+        # though the released remainder was never captured.
+        record["remaining_amount"] = authorization_remaining(record)
+
+        payment_id = store._next_id("payment", "pay")
+        record["payment_id"] = payment_id
+        record.setdefault("payment_ids", []).append(payment_id)
+
+        memo = record.get("note")
+        store._add_activity(
+            owner=payer,
+            type="payment",
+            actor=receiver,
+            direction="out",
+            amount=amount,
+            counterparty=receiver,
+            related_id=payment_id,
+            memo=memo,
+        )
+        store._add_activity(
+            owner=receiver,
+            type="payment",
+            actor=payer,
+            direction="in",
+            amount=amount,
+            counterparty=payer,
+            related_id=payment_id,
+            memo=memo,
+        )
+
+        result = (
+            201,
+            {
+                "status": "ok",
+                "payment_id": payment_id,
+                "id": payment_id,
+                "from": payer,
+                "to": receiver,
+                "amount": amount,
+                "note": memo,
+                "created_at": moment,
+                "authorization_id": authorization_id,
+                "request_id": None,
+                "authorization": store.authorization_public(record),
+                "balances": {payer: store.balances[payer], receiver: store.balances[receiver]},
+                "balance_sum": sum(store.balances.values()),
+                "seeded_total": store.seeded_total,
+            },
+        )
+        store._idem_remember(me, key, print_id, result[0], result[1])
+        return result
+
+    status, payload = store.transaction(work)
+    return JSONResponse(status_code=status, content=payload)
 
 
 @router.post("/authorizations")

@@ -555,6 +555,91 @@ def test_list_requires_authentication(client):
     assert client.get("/authorizations").status_code == 401
 
 
+def test_an_unfiltered_list_is_never_truncated(client):
+    """Stage-1 never truncated these lists, so truncation must be opt-in.
+
+    Seeded straight into the store: 1201 records would dominate the suite's
+    runtime through the API, and this is about the pagination arithmetic, not
+    about request creation.
+    """
+    from app.dependencies import store
+    from app.store import now_iso
+
+    moment = now_iso()
+
+    def seed() -> None:
+        for index in range(1201):
+            record_id = f"r_bulk_{index:05d}"
+            store.requests[record_id] = {
+                "id": record_id,
+                "from": "ada",
+                "from_handle": "ada",
+                "to": "bob",
+                "to_handle": "bob",
+                "amount": 1,
+                "status": "open",
+                "note": None,
+                "created_at": moment,
+                "updated_at": moment,
+            }
+
+    store.transaction(seed)
+
+    tok = login(client, "ada")
+    everything = client.get("/requests", headers=auth(tok)).json()
+    assert everything["total"] == 1201
+    assert everything["count"] == 1201, "an unfiltered list must not truncate"
+    assert everything["has_more"] is False
+    assert everything["limit"] is None
+
+    # an explicit limit is what opts into pagination
+    paged = client.get("/requests?limit=1000", headers=auth(tok)).json()
+    assert paged["count"] == 1000
+    assert paged["total"] == 1201
+    assert paged["has_more"] is True
+
+    tail = client.get("/requests?limit=1000&offset=1000", headers=auth(tok)).json()
+    assert tail["count"] == 201
+    assert tail["has_more"] is False
+
+
+def test_the_same_default_applies_to_authorizations(client):
+    from app.dependencies import store
+    from app.store import now_iso
+
+    moment = now_iso()
+
+    def seed() -> None:
+        for index in range(1100):
+            record_id = f"a_bulk_{index:05d}"
+            store.authorizations[record_id] = {
+                "id": record_id,
+                "from": "ada",
+                "from_handle": "ada",
+                "to": "bob",
+                "to_handle": "bob",
+                "amount": 1,
+                "captured_amount": 0,
+                "remaining_amount": 1,
+                "status": "voided",
+                "note": None,
+                "visibility": "public",
+                "created_at": moment,
+                "updated_at": moment,
+                "expires_at": None,
+                "payment_id": None,
+                "payment_ids": [],
+            }
+
+    store.transaction(seed)
+
+    tok = login(client, "ada")
+    body = client.get("/authorizations", headers=auth(tok)).json()
+    assert body["total"] == 1100
+    assert body["count"] == 1100, "an unfiltered list must not truncate"
+    assert body["has_more"] is False
+
+
 # ----------------------------------------------------------------------
 # GET /authorizations/{id}
 # ----------------------------------------------------------------------

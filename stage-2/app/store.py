@@ -52,6 +52,12 @@ MAX_AUTHORIZATION_AMOUNT = 1_000_000_000
 MAX_AUTHORIZATION_NOTE_CHARS = 200
 AUTHORIZATION_VISIBILITIES = ("public", "private")
 
+#: Ceiling on an explicitly requested page for ``GET /requests`` and
+#: ``GET /authorizations``. Truncation is opt-in: omitting ``limit`` returns
+#: every match, because the accepted Stage-1 list never truncated. This only
+#: bounds a page a caller deliberately asked for.
+MAX_LIST_LIMIT = 10_000
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -89,6 +95,27 @@ def authorization_open_at(record: dict[str, Any], now: datetime) -> bool:
         return False
     expires_at = parse_iso(record.get("expires_at"))
     return expires_at is None or expires_at > now
+
+
+def authorization_remaining(record: dict[str, Any]) -> int:
+    """Minor units this record still holds.
+
+    The spec's definition: the amount still held, zero when closed. A record is
+    closed unless it is ``open``, and a final capture or a void releases the
+    uncaptured remainder *without* capturing it - so ``amount - captured``
+    alone would keep reporting that released remainder as still held. Every
+    caller (the ``held`` computation, capture validation and the public
+    projection) goes through here so they cannot disagree.
+    """
+    if record.get("status") != "open":
+        return 0
+    amount = record.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, int):
+        return 0
+    captured = record.get("captured_amount")
+    if isinstance(captured, bool) or not isinstance(captured, int) or captured < 0:
+        captured = 0
+    return max(0, amount - captured)
 
 
 def is_bcrypt_hash(value: Any) -> bool:
@@ -260,10 +287,25 @@ class Store:
         self.balances[frm] = self.balances[frm] - amount
         self.balances[to] = self.balances.get(to, 0) + amount
 
+    def _transfer_from_hold(self, payer: str, receiver: str, amount: int) -> None:
+        """Move ``amount`` from ``payer`` to ``receiver`` against a hold.
+
+        Deliberately *not* ``_transfer``: that checks ``available``, and the
+        payer's available is already reduced by the very hold being consumed, so
+        requiring it here would make every capture unsatisfiable. This is safe
+        because the caller has already checked ``amount`` against that
+        authorization's remainder, and the remainder is part of the payer's
+        balance (I1: ``balance == total``), so the payer cannot go negative.
+        """
+        if self.balances.get(payer, 0) < amount:
+            raise insufficient_funds(payer, self.balances.get(payer, 0), amount)
+        self.balances[payer] = self.balances[payer] - amount
+        self.balances[receiver] = self.balances.get(receiver, 0) + amount
+
     # ------------------------------------------------------------------
     # funds: total / held / available  (stage-2 section 3)
     #
-    #   held      = sum(amount of the user's unexpired *open* authorizations)
+    #   held      = sum(remaining of the user's unexpired *open* authorizations)
     #   available = total - held        (>= 0 by invariant I5)
     #
     # Every helper below is lock-free: callers already hold self.lock.
@@ -293,14 +335,20 @@ class Store:
         return changed
 
     def _held_amount(self, handle: str, now: datetime | None = None) -> int:
-        """Sum of the user's unexpired open authorization amounts."""
+        """Sum of the user's unexpired open authorization **remainders**.
+
+        The remainder, not the face amount: after a partial capture
+        (``final: false``) the authorization stays open while holding only what
+        is left, so summing ``amount`` would over-reserve and make the released
+        part permanently unspendable.
+        """
         moment = now or datetime.now(timezone.utc)
         held = 0
         for record in self.authorizations.values():
             if record.get("from") != handle:
                 continue
             if authorization_open_at(record, moment):
-                held += int(record.get("amount") or 0)
+                held += authorization_remaining(record)
         return held
 
     def _available_amount(self, handle: str, now: datetime | None = None) -> int:
@@ -610,7 +658,7 @@ class Store:
             record["to"] = recipient
             record["to_handle"] = recipient
             record["captured_amount"] = captured
-            record["remaining_amount"] = amount - captured
+            record["remaining_amount"] = authorization_remaining(record)
             record["payment_id"] = record.get("payment_id")
             record["payment_ids"] = list(record.get("payment_ids") or [])
             record["note"] = record.get("note")
@@ -647,7 +695,8 @@ class Store:
         Emits both vocabularies on purpose: ``authorization_id``/``from_handle``/
         ``to_handle`` from the stage-2 spec, and ``id``/``from``/``to`` from the
         accepted Stage-1 contract. Both are additive, so neither lineage has to
-        guess. ``remaining_amount`` is derived, never stored stale.
+        guess. ``remaining_amount`` comes from ``authorization_remaining`` so it
+        reads zero for a closed record, never a stale derived value.
         """
         amount = int(record.get("amount") or 0)
         captured = int(record.get("captured_amount") or 0)
@@ -660,7 +709,7 @@ class Store:
             "to_handle": record.get("to_handle") or record.get("to"),
             "amount": amount,
             "captured_amount": captured,
-            "remaining_amount": max(amount - captured, 0),
+            "remaining_amount": authorization_remaining(record),
             "note": record.get("note"),
             "visibility": record.get("visibility") or "public",
             "status": record.get("status"),
