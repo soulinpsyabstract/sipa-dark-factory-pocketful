@@ -23,7 +23,7 @@ def health() -> dict[str, str]:
 @router.get("/")
 def index() -> dict[str, Any]:
     return {
-        "service": "pocketful-stage-1",
+        "service": "pocketful-stage-2",
         "status": "ok",
         "endpoints": [
             "GET  /health",
@@ -42,6 +42,7 @@ def index() -> dict[str, Any]:
             "POST /splits",
             "GET  /activity",
             "POST /settlements",
+            "POST /authorizations",
         ],
     }
 

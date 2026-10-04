@@ -208,6 +208,36 @@ def test_rejected_fixture_changes_nothing(client):
     assert client.get("/me", headers=auth(tok)).status_code == 200
 
 
+def test_over_hold_is_validated_against_the_new_balances_not_the_old_ones(client):
+    """Regression: seeded holds must be checked against the incoming fixture.
+
+    Import validates before installing, so reading the *outgoing* balances while
+    parsing would let an over-hold through whenever the new fixture shrinks a
+    balance below the hold.
+    """
+    # world A: alice has 5000, comfortably enough for a 3000 hold
+    rich = {"handle": "alice", "email": "alice@example.com", "password": PW}
+    poor_bob = {"handle": "bob", "email": "bob@example.com", "balance": 0, "password": PW}
+    assert client.post(
+        "/_test/reset",
+        json={"seeded_total": 5000, "users": [dict(rich, balance=5000), poor_bob]},
+    ).status_code == 200
+    # world B: alice drops to 1000 but still seeds a 3000 hold -> over-hold
+    r = client.post(
+        "/_test/reset",
+        json={
+            "seeded_total": 1000,
+            "users": [dict(rich, balance=1000), poor_bob],
+            "authorizations": [auth_seed("auth_big", "alice", 3000)],
+        },
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "validation_failed", r.text
+    # world A is intact - the rejected import changed nothing
+    assert me(client, "alice")["total"] == 5000
+    assert me(client, "alice")["held"] == 0
+
+
 def test_hold_exactly_equal_to_balance_is_allowed(client):
     r = client.post(
         "/_test/reset", json=fixture(authorizations=[auth_seed("auth_1", "alice", 1000)])
@@ -439,14 +469,12 @@ def test_split_cannot_spend_held_funds(client):
 
 def test_split_failure_on_a_hold_leaves_no_partial_movement(client):
     """The dry run must agree with _transfer, or the batch would half-apply."""
-    client.post(
-        "/_test/reset",
-        json=fixture(
-            authorizations=[
-                auth_seed("auth_1", "bob", 900),
-                auth_seed("auth_2", "carol", 900, to="alice"),
-            ]
-        ),
+    seed(
+        client,
+        authorizations=[
+            auth_seed("auth_1", "bob", 900),
+            auth_seed("auth_2", "carol", 900, to="alice"),
+        ],
     )
     tok = login(client, "alice")
     r = client.post(
@@ -455,6 +483,41 @@ def test_split_failure_on_a_hold_leaves_no_partial_movement(client):
     assert r.status_code == 422, r.text
     balances = client.get("/_test/export").json()["balances"]
     assert balances == {"alice": 1000, "bob": 1000, "carol": 1000, "op": 1000}
+
+
+def test_split_self_check_reports_available_not_balance(client):
+    """The caller's own-coverage guard must report what it actually tested.
+
+    Regression guard: this guard compared against ``available`` but used to raise
+    with the raw ``balance``, so under an open hold the error body claimed more
+    available than the check had seen.
+    """
+    seed(client, authorizations=[auth_seed("auth_1", "alice", 900)])
+    tok = login(client, "alice")
+    # total 1000, held 900 -> available 100. Charging 200 cannot be covered.
+    r = client.post(
+        "/splits", json={"amount": 200, "participants": ["bob"]}, headers=auth(tok)
+    )
+    assert r.status_code == 422, r.text
+    error = r.json()["error"]
+    assert error["code"] == "insufficient_funds"
+    assert error["available"] == 100, r.text
+    assert error["required"] == 200, r.text
+
+
+def test_split_participant_error_reports_available(client):
+    # bob's balance is 1000, so a 950 hold leaves available 50 - less than his
+    # 100 share. A 900 hold would leave exactly 100 and the split would
+    # legitimately succeed, which is what this test must not assert.
+    seed(client, authorizations=[auth_seed("auth_1", "bob", 950)])
+    tok = login(client, "alice")
+    r = client.post(
+        "/splits", json={"amount": 200, "participants": ["bob", "carol"]}, headers=auth(tok)
+    )
+    assert r.status_code == 422, r.text
+    error = r.json()["error"]
+    assert error["handle"] == "bob"
+    assert error["available"] == 50, r.text
 
 
 def test_settlement_cannot_spend_held_funds(client):

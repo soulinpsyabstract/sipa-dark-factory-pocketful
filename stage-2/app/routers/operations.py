@@ -361,6 +361,8 @@ def list_requests(
     me: CurrentUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
+    limit: int = Query(default=1000, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ) -> JSONResponse:
     """List the caller's requests.
 
@@ -368,6 +370,10 @@ def list_requests(
     it), or ``all`` (default). ``status``: one of ``open``/``paid``/
     ``declined``/``cancelled``, a comma-separated list, or ``all`` (default).
     Anything else -> 422.
+
+    ``limit``/``offset``/``has_more`` are additive and mirror
+    ``GET /authorizations``; the defaults leave an unfiltered Stage-1 request
+    untruncated.
     """
     direction = direction.strip().lower()
     if direction not in ("incoming", "outgoing", "all"):
@@ -404,11 +410,17 @@ def list_requests(
                 }
             )
         items.sort(key=lambda r: r["id"], reverse=True)
+        total = len(items)
+        items = items[offset : offset + limit]
         return {
             "status": "ok",
             "requests": items,
             "items": items,
             "count": len(items),
+            "total": total,
+            "has_more": offset + len(items) < total,
+            "limit": limit,
+            "offset": offset,
             "direction": direction,
             "status_filter": wanted,
         }
@@ -479,7 +491,9 @@ def create_split(body: SplitIn, request: Request, me: CurrentUser) -> JSONRespon
         if store._available_amount(me) < charged:
             from ..errors import insufficient_funds
 
-            raise insufficient_funds(me, store.balances.get(me, 0), charged)
+            # Report the same figure the guard tested, so the error body can
+            # never claim more available than the check actually saw.
+            raise insufficient_funds(me, store._available_amount(me), charged)
 
         for part in parts:
             if part["handle"] == me:

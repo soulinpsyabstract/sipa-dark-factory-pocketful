@@ -10,7 +10,15 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from .security import MAX_PASSWORD_BYTES
 
@@ -120,6 +128,34 @@ class FixtureUser(BaseModel):
     is_operator: bool = False
 
 
+class AuthorizationIn(BaseModel):
+    """Body of ``POST /authorizations``.
+
+    Deliberately permissive: the field types are loose and the handler does the
+    validating. ``stage-2/SPEC.md`` requires ``422 validation_failed`` for a bad
+    ``amount``/``note``/``visibility``, but a pydantic constraint failure would
+    surface as the shared ``validation_error`` code that the accepted Stage-1
+    contract pins. Validating by hand keeps the two vocabularies apart.
+
+    Both ``to`` (the team's Stage-1 convention) and ``to_handle`` (the spec's
+    spelling) are accepted on input.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    to: str | None = Field(default=None)
+    amount: Any = None
+    note: str | None = None
+    visibility: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_to_handle(cls, data: Any) -> Any:
+        if isinstance(data, dict) and data.get("to") is None and data.get("to_handle"):
+            data = {**data, "to": data["to_handle"]}
+        return data
+
+
 class FixtureIn(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -131,6 +167,16 @@ class FixtureIn(BaseModel):
     #: balances, so a fixture that over-holds is rejected 422
     #: validation_failed and the live state is left untouched.
     authorizations: list[dict[str, Any]] = Field(default_factory=list)
+    #: stage-2: service-wide default authorization lifetime. Positive integer
+    #: seconds; defaults to 600 when omitted. ``StrictInt`` so that
+    #: ``"600"``/``600.0``/``True`` are rejected 422 rather than coerced - the
+    #: same strictness the Stage-1 amount models already use.
+    authorization_ttl_seconds: StrictInt | None = None
+    #: stage-2 display metadata. Additive only - the accepted Stage-1 contract
+    #: has no currency model, so these default to the spec's example values and
+    #: are carried through untouched.
+    currency: str | None = None
+    minor_units: int | None = None
 
 
 def to_fixture_dict(payload: Any) -> dict[str, Any]:

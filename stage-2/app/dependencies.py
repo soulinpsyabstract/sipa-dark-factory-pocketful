@@ -77,6 +77,8 @@ def _user_public(
     user: dict,
     balances: dict[str, int],
     funds: dict[str, int] | None = None,
+    currency: str | None = None,
+    minor_units: int | None = None,
 ) -> dict[str, Any]:
     """The single public projection of a user. **Lock-free by contract.**
 
@@ -113,4 +115,7 @@ def _user_public(
         "held": held,
         "available": balance - held,
         "created_at": user.get("created_at") or "",
+        # stage-2 display metadata, carried through from the fixture.
+        "currency": currency or "EUR",
+        "minor_units": 2 if minor_units is None else minor_units,
     }

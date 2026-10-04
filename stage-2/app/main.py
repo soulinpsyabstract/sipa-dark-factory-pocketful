@@ -16,16 +16,16 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .errors import AppError
-from .routers import auth, operations, system
+from .routers import auth, authorizations, operations, system
 from .store import InvariantViolation
 
 app = FastAPI(
-    title="Pocketful API - Stage 1",
+    title="Pocketful API - Stage 2",
     version=__version__,
     description=(
-        "In-memory wallet & payments service. Amounts are integer minor units. "
-        "Sum of all balances always equals the seeded total; negative balances "
-        "are impossible."
+        "In-memory wallet & payments service with payment authorizations. Amounts "
+        "are integer minor units. Sum of all balances always equals the seeded "
+        "total; negative balances are impossible; available = total - held."
     ),
 )
 
@@ -105,6 +105,7 @@ async def http_failed(request: Request, exc: StarletteHTTPException) -> JSONResp
 app.include_router(system.router)
 app.include_router(auth.router)
 app.include_router(operations.router)
+app.include_router(authorizations.router)
 
 
 def main() -> None:
@@ -112,7 +113,7 @@ def main() -> None:
 
     port = int(os.environ.get("PORT", "8080"))
     host = os.environ.get("HOST", "0.0.0.0")
-    print(f"pocketful stage-1 listening on {host}:{port}", flush=True)
+    print(f"pocketful stage-2 listening on {host}:{port}", flush=True)
     uvicorn.run(app, host=host, port=port, log_level=os.environ.get("LOG_LEVEL", "info"))
 
 

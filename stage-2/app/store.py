@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import itertools
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, TypeVar
 
 from .errors import AppError, insufficient_funds, validation_error
@@ -40,6 +40,17 @@ TERMINAL_REQUEST_STATUSES = ("paid", "declined", "cancelled")
 
 AUTHORIZATION_STATUSES = ("open", "captured", "voided", "expired")
 TERMINAL_AUTHORIZATION_STATUSES = ("captured", "voided", "expired")
+
+#: stage-2 fixture defaults, per spec section "Model".
+DEFAULT_AUTHORIZATION_TTL_SECONDS = 600
+DEFAULT_CURRENCY = "EUR"
+DEFAULT_MINOR_UNITS = 2
+
+#: ``POST /authorizations`` bounds. The spec fixes these exactly.
+MIN_AUTHORIZATION_AMOUNT = 1
+MAX_AUTHORIZATION_AMOUNT = 1_000_000_000
+MAX_AUTHORIZATION_NOTE_CHARS = 200
+AUTHORIZATION_VISIBILITIES = ("public", "private")
 
 
 def now_iso() -> str:
@@ -104,6 +115,11 @@ class Store:
         self.idempotency: dict[tuple[str, str], dict[str, Any]] = {}
         self.tokens: dict[str, str] = {}
         self.seeded_total: int = 0
+        #: stage-2 fixture knobs. Defaulted per the spec (600 seconds, EUR, 2
+        #: decimal places) and re-seeded by every reset/import.
+        self.authorization_ttl_seconds: int = DEFAULT_AUTHORIZATION_TTL_SECONDS
+        self.currency: str = DEFAULT_CURRENCY
+        self.minor_units: int = DEFAULT_MINOR_UNITS
 
         self._ids = {
             "request": itertools.count(1),
@@ -403,7 +419,14 @@ class Store:
         # Seeded authorizations are parsed and fully validated BEFORE anything is
         # assigned, so a rejected fixture leaves the live world untouched - the
         # 422 validation_failed path is atomic by construction.
-        authorizations = self._parse_authorization_records(fixture.get("authorizations") or [])
+        authorizations = self._parse_authorization_records(
+            fixture.get("authorizations") or [], balances
+        )
+
+        ttl = self._parse_authorization_ttl(fixture.get("authorization_ttl_seconds"))
+        currency, minor_units = self._parse_display_metadata(
+            fixture.get("currency"), fixture.get("minor_units")
+        )
 
         self.users = users
         self.balances = balances
@@ -413,26 +436,113 @@ class Store:
         self.activity = []
         self.idempotency = {}
         self.tokens = {}
+        self.authorization_ttl_seconds = ttl
+        self.currency = currency
+        self.minor_units = minor_units
         self._ids = {k: itertools.count(1) for k in self._ids}
         self._sync_authorization_ids()
         self._check_invariants()
+
+    @staticmethod
+    def _parse_authorization_ttl(raw: Any) -> int:
+        """``authorization_ttl_seconds`` - default 600, must be a positive int."""
+        if raw is None:
+            return DEFAULT_AUTHORIZATION_TTL_SECONDS
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise validation_error(
+                "'authorization_ttl_seconds' must be an integer number of seconds",
+                code="validation_failed",
+            )
+        if raw <= 0:
+            raise validation_error(
+                "'authorization_ttl_seconds' must be a positive number of seconds",
+                code="validation_failed",
+            )
+        return raw
+
+    @staticmethod
+    def _parse_display_metadata(raw_currency: Any, raw_minor_units: Any) -> tuple[str, int]:
+        """Currency/minor units are additive display metadata."""
+        currency = DEFAULT_CURRENCY
+        if raw_currency is not None:
+            if not isinstance(raw_currency, str) or not raw_currency.strip():
+                raise validation_error(
+                    "'currency' must be a non-empty string", code="validation_failed"
+                )
+            currency = raw_currency.strip().upper()
+
+        minor_units = DEFAULT_MINOR_UNITS
+        if raw_minor_units is not None:
+            if isinstance(raw_minor_units, bool) or not isinstance(raw_minor_units, int):
+                raise validation_error(
+                    "'minor_units' must be an integer", code="validation_failed"
+                )
+            if not 0 <= raw_minor_units <= 6:
+                raise validation_error(
+                    "'minor_units' must be between 0 and 6", code="validation_failed"
+                )
+            minor_units = raw_minor_units
+        return currency, minor_units
 
     # ------------------------------------------------------------------
     # authorization records
     # ------------------------------------------------------------------
 
-    def _parse_authorization_records(self, raw: Any) -> dict[str, dict[str, Any]]:
+    def _create_authorization(
+        self,
+        *,
+        sender: str,
+        recipient: str,
+        amount: int,
+        note: str | None,
+        visibility: str,
+    ) -> dict[str, Any]:
+        """Build, register and return a fresh ``open`` authorization.
+
+        The caller is responsible for having already checked availability and
+        every other rejection case, and for holding the lock.
+        """
+        created = datetime.now(timezone.utc)
+        record = {
+            "id": self._next_id("authorization", "a"),
+            "from": sender,
+            "from_handle": sender,
+            "to": recipient,
+            "to_handle": recipient,
+            "amount": amount,
+            "captured_amount": 0,
+            "remaining_amount": amount,
+            "note": note,
+            "visibility": visibility,
+            "status": "open",
+            "created_at": created.isoformat(),
+            "updated_at": created.isoformat(),
+            "expires_at": (created + timedelta(seconds=self.authorization_ttl_seconds)).isoformat(),
+            "payment_id": None,
+            "payment_ids": [],
+        }
+        self.authorizations[record["id"]] = record
+        return record
+
+    def _parse_authorization_records(
+        self,
+        raw: Any,
+        balances: dict[str, int],
+    ) -> dict[str, dict[str, Any]]:
         """Validate authorization records and normalise their shape.
 
         Shared by ``_install_fixture`` (seeded holds) and, from W6,
         ``_install_full_export`` (restored holds) so both entry points agree on
-        what a well-formed record is. Balances come from ``self.balances``
-        because every other record already carries the new state.
+        what a well-formed record is.
+
+        ``balances`` is passed explicitly rather than read from ``self``: during
+        an import the new balances are not installed yet, so reading
+        ``self.balances`` would validate the incoming holds against the
+        *outgoing* world and let an over-hold slip through.
         """
         if not isinstance(raw, list):
             raise validation_error("'authorizations' must be a list", code="validation_failed")
 
-        balances = self.balances
         now = datetime.now(timezone.utc)
         parsed: dict[str, dict[str, Any]] = {}
         for entry in raw:
@@ -531,6 +641,37 @@ class Store:
 
         return parsed
 
+    def authorization_public(self, record: dict[str, Any]) -> dict[str, Any]:
+        """The public projection of one authorization record.
+
+        Emits both vocabularies on purpose: ``authorization_id``/``from_handle``/
+        ``to_handle`` from the stage-2 spec, and ``id``/``from``/``to`` from the
+        accepted Stage-1 contract. Both are additive, so neither lineage has to
+        guess. ``remaining_amount`` is derived, never stored stale.
+        """
+        amount = int(record.get("amount") or 0)
+        captured = int(record.get("captured_amount") or 0)
+        return {
+            "authorization_id": record["id"],
+            "id": record["id"],
+            "from": record.get("from"),
+            "from_handle": record.get("from_handle") or record.get("from"),
+            "to": record.get("to"),
+            "to_handle": record.get("to_handle") or record.get("to"),
+            "amount": amount,
+            "captured_amount": captured,
+            "remaining_amount": max(amount - captured, 0),
+            "note": record.get("note"),
+            "visibility": record.get("visibility") or "public",
+            "status": record.get("status"),
+            "created_at": record.get("created_at"),
+            "updated_at": record.get("updated_at"),
+            "expires_at": record.get("expires_at"),
+            "payment_id": record.get("payment_id"),
+            "payment_ids": list(record.get("payment_ids") or []),
+            "closed_at": record.get("closed_at"),
+        }
+
     def _sync_authorization_ids(self) -> None:
         """Restart the id counter above any authorization id already in use."""
         highest = 0
@@ -543,6 +684,9 @@ class Store:
     def _export(self) -> dict[str, Any]:
         return {
             "seeded_total": self.seeded_total,
+            "currency": self.currency,
+            "minor_units": self.minor_units,
+            "authorization_ttl_seconds": self.authorization_ttl_seconds,
             "users": [dict(u) for u in self.users.values()],
             "balances": dict(self.balances),
             "requests": [dict(r) for r in self.requests.values()],
