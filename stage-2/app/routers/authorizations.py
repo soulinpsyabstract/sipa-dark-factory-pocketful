@@ -74,7 +74,11 @@ def fingerprint(method: str, path: str, raw: bytes) -> str:
 
 
 def required_idempotency_key(request: Request) -> str:
-    """``Idempotency-Key`` is required on the authorization write paths."""
+    """``Idempotency-Key`` is required on create and capture.
+
+    Not on void: that path is naturally idempotent because voiding an
+    already-voided authorization returns ``200`` with the current state.
+    """
     for header in ("idempotency-key", "x-idempotency-key"):
         raw = request.headers.get(header)
         if raw and raw.strip():
@@ -460,6 +464,81 @@ def capture_authorization(
 
     status, payload = store.transaction(work)
     return JSONResponse(status_code=status, content=payload)
+
+
+@router.post("/authorizations/{authorization_id}/void")
+def void_authorization(authorization_id: str, me: CurrentUser) -> JSONResponse:
+    """Release an open authorization's hold. Only the payer may void.
+
+    No ``Idempotency-Key`` (like decline and cancel): the operation is naturally
+    idempotent, because voiding an already-voided authorization is ``200`` with
+    the current state rather than an error.
+
+    Voiding a partially captured authorization is allowed: it releases only the
+    uncaptured remainder and preserves every capture record. A ``captured`` or
+    ``expired`` authorization is ``409 authorization_not_open``.
+    """
+    def work() -> tuple[int, dict[str, Any]]:
+        record = store.authorizations.get(authorization_id)
+        if record is None:
+            raise not_found(
+                f"no such authorization: {authorization_id!r}",
+                code="not_found",
+                authorization_id=authorization_id,
+            )
+        if record.get("from") != me:
+            # 403 for the receiver and for bystanders alike, per the spec.
+            raise AppError(
+                403,
+                "forbidden",
+                "only the payer of an authorization may void it",
+                id=authorization_id,
+                handle=me,
+            )
+
+        moment = now_iso()
+
+        # Already voided: 200 with the current state, no second transition.
+        if record.get("status") == "voided":
+            return 200, _void_response(record, store._funds(me), already=True)
+
+        # Sweep before the open check so a clock-expired authorization reads as
+        # expired and is refused, per the spec's table.
+        store._expire_authorizations()
+        if record.get("status") != "open":
+            raise AppError(
+                409,
+                "authorization_not_open",
+                f"authorization {authorization_id!r} is {record.get('status')!r}, only an 'open' one can be voided",
+                id=authorization_id,
+                status=record.get("status"),
+            )
+
+        record["status"] = "voided"
+        record["closed_at"] = moment
+        record["updated_at"] = moment
+        # Releases the remainder; capture records and captured_amount are kept.
+        record["remaining_amount"] = authorization_remaining(record)
+        return 200, _void_response(record, store._funds(me), already=False)
+
+    status, payload = store.transaction(work)
+    return JSONResponse(status_code=status, content=payload)
+
+
+def _void_response(
+    record: dict[str, Any], funds: dict[str, int], already: bool
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        **store.authorization_public(record),
+        "already_voided": already,
+        "currency": store.currency,
+        "from_funds": funds,
+        "available": funds["available"],
+        "held": funds["held"],
+        "total": funds["total"],
+        "balance": funds["balance"],
+    }
 
 
 @router.post("/authorizations")
