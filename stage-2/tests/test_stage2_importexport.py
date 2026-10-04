@@ -380,14 +380,22 @@ def _busy_world(client):
 
 
 def _state(client):
+    """Snapshot for "a rejected import changes nothing".
+
+    The buckets that carry authority - ``authorizations`` and ``tokens`` - are
+    compared by value, not by length. A count would pass while a hold or a live
+    session was silently rewritten, which is precisely the W5 defect shape:
+    import dropped every authorization, so a count could stay right while the
+    hold itself vanished.
+    """
     snap = export(client)
     return {
         "balances": snap["balances"],
-        "requests": len(snap["requests"]),
-        "authorizations": len(snap["authorizations"]),
-        "activity": len(snap["activity"]),
-        "idempotency": len(snap["idempotency"]),
-        "tokens": len(snap["tokens"]),
+        "requests": snap["requests"],
+        "authorizations": snap["authorizations"],
+        "activity": snap["activity"],
+        "idempotency": snap["idempotency"],
+        "tokens": snap["tokens"],
     }
 
 
@@ -458,3 +466,85 @@ def test_a_payload_with_nothing_recognisable_is_refused(client):
     r = do_import(client, {"unrelated": "thing"})
     assert r.status_code == 422, r.text
     assert _state(client) == before
+
+
+# ----------------------------------------------------------------------
+# Core's additions: the two properties that would have caught W5
+# ----------------------------------------------------------------------
+
+
+def _stable(snap):
+    """Export minus the wall-clock stamp, so two snapshots can be compared."""
+    return {k: v for k, v in snap.items() if k != "exported_at"}
+
+
+def test_a_rejected_import_leaves_tokens_and_authorizations_byte_identical(client):
+    """A 422 must not touch the buckets that carry authority.
+
+    Asserted by value rather than by count: a hold or a session can be rewritten
+    without changing how many there are.
+    """
+    _busy_world(client)
+    before = _state(client)
+    assert before["authorizations"], "needs a populated world to be meaningful"
+    assert before["tokens"], "needs a live session to be meaningful"
+
+    payload = export(client)
+    # Move the money first, so a partial write that lands before validation
+    # fails would be unmistakable in the balances too.
+    payload["balances"] = {"ada": 1111, "bob": 889, "cyd": 0}
+    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+
+    assert do_import(client, payload).status_code == 422
+
+    after = _state(client)
+    assert after["tokens"] == before["tokens"], "tokens were rewritten by a rejected import"
+    assert after["authorizations"] == before["authorizations"], (
+        "authorizations were rewritten by a rejected import"
+    )
+    assert after == before
+
+
+def test_export_import_export_reaches_a_fixed_point(client):
+    """export -> import -> export must be idempotent.
+
+    If an import silently drops a field, the second export differs from the
+    first and every subsequent cycle drifts further. This is the property that
+    makes hold or token loss impossible to miss.
+    """
+    _busy_world(client)
+
+    first = export(client)
+    assert do_import(client, first).status_code == 200
+    second = export(client)
+    assert _stable(second) == _stable(first), "first round trip lost information"
+
+    assert do_import(client, second).status_code == 200
+    third = export(client)
+    assert _stable(third) == _stable(second), "import is not idempotent"
+
+
+def test_importing_the_same_export_twice_never_releases_a_hold(client):
+    """The exact shape of the W5 defect, pinned as a regression.
+
+    In W5 an import wiped every open authorization, so one import turned
+    ``held 800`` into ``held 0`` and handed the money back as spendable. Repeat
+    imports must be inert, not cumulative.
+    """
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    assert wallet(client, "ada") == (2000, 800, 1200)
+
+    for _ in range(3):
+        assert do_import(client, export(client)).status_code == 200
+        assert wallet(client, "ada") == (2000, 800, 1200), "a hold was released by import"
+
+    # And the restored hold still blocks spending, which is the whole point.
+    r = client.post(
+        "/payments", json={"to": "cyd", "amount": 1300}, headers=auth(login(client, "ada"), "p1")
+    )
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "insufficient_funds", r.text
