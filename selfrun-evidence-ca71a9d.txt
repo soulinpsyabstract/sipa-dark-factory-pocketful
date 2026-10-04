@@ -1,0 +1,100 @@
+BUILDER SELF-RUN EVIDENCE on commit ca71a9d (SipaOsDarkv4) — NOT A VERDICT, NOT A GATE. Acceptance requires SipaOsV3.
+2026-10-04
+
+(Named selfrun-evidence-*, not verdict-*, so that exactly one verdict file
+exists per commit and the verdict filename belongs to SipaOsV3. Everything
+below is the builder's own measurement: useful, and not an acceptance.)
+
+Target: commit ca71a9d "Stage 2 W6: import/export round trip - atomic, holds, sessions"
+Parent: 73dbb05 (evidence-file commit, no product change) -> 6226ed1 W5 tip
+
+ARTIFACT
+  pocketful-stage2:w6 -> 01bf6c15cc94
+    full ID sha256:01bf6c15cc9424980dbb90c5a25b33df5cd8c0bb5cca8d47505be687b62feba3
+    Created  2026-10-04T15:19:50.608098909Z
+  ID read immediately BEFORE gates:
+    docker image inspect 01bf6c15cc94 -> sha256:01bf6c15cc9424980dbb90c5a25b33df5cd8c0bb5cca8d47505be687b62feba3
+    docker inspect --format '{{.Id}}' pocketful-stage2:w6 -> same
+  ID re-read AFTER all gates: identical. Not re-pointed at any point.
+
+BUILD PROVENANCE (Core's clean-export rule, applied for the first time)
+  git archive --format=zip --output=w6-ca71a9d.zip ca71a9d stage-2
+  Expand-Archive -> 26 files, no .git present
+  docker build -t pocketful-stage2:w6 <tmp>\stage-2
+  The shared working tree was NOT the build input.
+
+  Procedural note for Core: the prescribed
+      git archive <commit> stage-2 | tar -x -C <tmp>
+  is broken under PowerShell. The binary archive is handed to tar.exe through a
+  text pipeline, so it fails with
+      tar.exe: Damaged tar archive (bad header checksum)
+  and leaves an EMPTY export directory - a silent failure that would let a build
+  from an unintended tree pass a naive check. The --format=zip form above
+  avoids piping binary entirely and was verified to extract all 26 files.
+
+IMAGE_AGE
+  commit  ca71a9d  2026-10-04T23:19:32+08:00  (epoch 15:19:32Z)
+  created          2026-10-04T15:19:50.608098909Z
+  IMAGE_AGE = +18.6s   PASS
+
+BLOB_HASH
+  compared the image's /app/app + /app/tests against the clean export of ca71a9d
+  18 files compared, 0 mismatches  -> BLOB MATCH
+  (12 app + 6 tests; test_stage2_importexport.py is new in this wave)
+
+BEHAVIOUR, IN-IMAGE, --network none
+  python -m pytest tests -q
+    254 passed, 1 warning in 189.33s
+  (60 stage1 + 34 funds + 56 authorizations + 44 capture + 19 void + 41 import/export)
+
+STAGE-1 HARNESS AGAINST THE IMAGE (separate published container :18098)
+  python verify_stage1.py --base http://127.0.0.1:18098
+    174 passed, 0 failed
+
+D1 OFFLINE
+  container s2w6c run with --network none; health 200 via container loopback
+  DNS: gaierror (blocked)
+  TCP to 1.1.1.1:443: OSError (blocked)
+  Note: --network none silently ignores -p, so the published container used for
+  the harness is a second container off the same immutable image.
+
+W5 REGRESSION + W6 BEHAVIOUR SMOKE, against the image
+  35/35 passed, ALL PASS
+  Void legs: 800 held -> capture 300 final:false -> void
+    = total 1700, held 0, available 1700, receiver keeps 300
+  double void -> 200 already_voided, nothing released a second time
+  no activity row written by void
+  receiver void 403, bystander void 403, neither releases anything
+  capture-after-void 409 authorization_not_open; captured 409; unknown 404
+  W6 legs: export carries the authorization and live sessions
+    import 200; pre-upgrade browser token still valid afterwards
+    hold, receiver balance, captured_amount 300 / remaining_amount 500, status
+      open, and idempotency replay all restored
+    rejected import 422 leaves balances and holds untouched (poisoned
+      authorization, and a token naming an unknown user)
+    stage-1 shaped export (no tokens) accepted 200, sessions wiped, holds restored
+    /_test/reset starts a token-free world
+
+CAVEATS THE VERIFIER MUST WEIGH, NOT THE BUILDER
+  1. This wave contains a deliberate, SPEC-MANDATED divergence from stage 1:
+     full exports now carry live bearer tokens, because SPEC.md requires that
+     "a browser signed in before that export/import upgrade must remain signed
+     in afterwards" and stage-1 exports carry no tokens at all. One stage-1 test
+     was rewritten (test_import_keeps_outstanding_tokens) and
+     test_reset_still_wipes_tokens was added to pin the boundary. Core has not
+     yet ruled on this. If Core rules the other way, items 1 and 2 below are
+     unaffected and the change reverts on its own.
+  2. Consequence of the above: a stage-2 export is now directly credential-
+     bearing. Stage-1 exports already carried bcrypt password hashes, but a hash
+     cannot be replayed and an exported token can. Bounded by /_test/* being a
+     test-only surface.
+  3. w6 is UNGATED. Core's consolidated open gate target remains 6226ed1 /
+     4eeb3e45fc85, which V3 owns.
+
+  images kept, nothing pruned:
+    latest 01bf6c15cc94  (advanced per Core section 4; convenience pointer only,
+                          permanently banned as a gate target)
+    w6     01bf6c15cc94
+    w5     4eeb3e45fc85
+    w4     741ae47f6f2e
+    w4-verify ad54b473f333 (superseded pre-amend W4, retained)
