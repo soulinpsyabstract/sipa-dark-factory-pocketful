@@ -582,13 +582,42 @@ def test_all_sixteen_endpoints_present(client):
     assert not bad, bad
 
 
-def test_import_invalidates_outstanding_tokens(client):
+def test_import_keeps_outstanding_tokens(client):
+    """STAGE-2 DIVERGENCE from the stage-1 copy of this test.
+
+    Stage 1 exported no tokens and its import therefore wiped every bearer
+    token; the stage-1 copy of this test asserted ``401`` afterwards.
+
+    ``stage-2/SPEC.md`` ("Existing clients after an upgrade") overrides that:
+    "A browser signed in before that export/import upgrade must remain signed
+    in afterwards." That is only satisfiable if the snapshot carries the live
+    sessions, so a stage-2 export includes ``tokens`` and a full-export import
+    restores them.
+
+    Scope of the change, deliberately narrow:
+      * only a FULL export round trip preserves a session;
+      * ``POST /_test/reset`` and a bare-fixture import still start a fresh
+        world with no sessions, exactly as in stage 1;
+      * a token naming a user absent from the payload is refused (422), so an
+        import can never resurrect a login for a user it did not carry.
+
+    ``verify_stage1.py`` is unaffected: line 769 already accommodates either
+    behaviour ("both wipe every bearer token. Tokens are minted after.").
+    """
     tok = token(client)
     assert client.get("/me", headers=auth(tok)).status_code == 200
     client.post("/_test/import", json=client.get("/_test/export").json())
-    # documented behaviour: import replaces all state, tokens included
-    assert client.get("/me", headers=auth(tok)).status_code == 401
+    # the pre-import session still works, and a fresh one works too
+    assert client.get("/me", headers=auth(tok)).status_code == 200
     assert client.get("/me", headers=auth(token(client))).status_code == 200
+
+
+def test_reset_still_wipes_tokens(client):
+    """The counterpart: a reset is a brand-new world, sessions and all."""
+    tok = token(client)
+    assert client.get("/me", headers=auth(tok)).status_code == 200
+    client.post("/_test/reset", json=FIXTURE)
+    assert client.get("/me", headers=auth(tok)).status_code == 401
 
 
 def test_no_state_leaks_between_fixtures(client):

@@ -20,6 +20,7 @@ I4  every stored password is a bcrypt hash (never plaintext)
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import itertools
 import threading
@@ -754,8 +755,57 @@ class Store:
                 }
                 for key, rec in self.idempotency.items()
             ],
+            # Sessions are part of the snapshot: the spec requires a browser
+            # signed in before an export/import upgrade to still be signed in
+            # afterwards, so the live tokens have to travel with the state.
+            "tokens": [
+                {"token": token, "handle": handle}
+                for token, handle in self.tokens.items()
+            ],
             "balance_sum": sum(self.balances.values()),
             "invariants": self.invariant_report(),
+        }
+
+    # ------------------------------------------------------------------
+    # rollback support, so a rejected import leaves the world untouched
+    # ------------------------------------------------------------------
+
+    #: Every mutable attribute an import may touch. ``_ids`` is rebuilt from
+    #: the restored lengths rather than copied, because ``itertools.count``
+    #: is not copyable.
+    _IMPORT_FIELDS = (
+        "users",
+        "balances",
+        "requests",
+        "authorizations",
+        "activity",
+        "idempotency",
+        "tokens",
+        "seeded_total",
+        "authorization_ttl_seconds",
+        "currency",
+        "minor_units",
+    )
+
+    def _capture_state(self) -> dict[str, Any]:
+        """Deep-copy every field ``_import`` may write, plus the id counters."""
+        saved = {name: copy.deepcopy(getattr(self, name)) for name in self._IMPORT_FIELDS}
+        saved["_id_positions"] = {
+            kind: next(counter) - 1 for kind, counter in self._ids.items()
+        }
+        return saved
+
+    def _restore_state(self, saved: dict[str, Any]) -> None:
+        """Put back a ``_capture_state`` snapshot verbatim.
+
+        Each field is rebound to a fresh object, so no live caller can be
+        holding a reference into the discarded copy.
+        """
+        for name in self._IMPORT_FIELDS:
+            setattr(self, name, copy.deepcopy(saved[name]))
+        self._ids = {
+            kind: itertools.count(position + 1)
+            for kind, position in saved["_id_positions"].items()
         }
 
     def _import(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -765,22 +815,32 @@ class Store:
         ``idempotency`` alongside ``users``) is restored verbatim, so
         export -> import -> export round-trips. A bare fixture goes through
         ``_install_fixture`` and clears requests/activity/idempotency exactly
-        as ``/_test/reset`` does.
+        as on ``/_test/reset`` does.
+
+        Import is all-or-nothing: the whole payload is validated and applied
+        under a snapshot, and any rejection puts every field back exactly as it
+        was. A 422 therefore never leaves a half-replaced world behind.
         """
         if not isinstance(payload, dict):
             raise validation_error("import payload must be a JSON object")
 
         is_full_export = "requests" in payload or "activity" in payload or "idempotency" in payload
-        if is_full_export:
-            return self._install_full_export(payload)
+        saved = self._capture_state()
+        try:
+            if is_full_export:
+                return self._install_full_export(payload)
 
-        if "users" in payload or "balances" in payload or "seeded_total" in payload or "total" in payload:
-            self._install_fixture(payload)
-            return self._export()
+            if "users" in payload or "balances" in payload or "seeded_total" in payload or "total" in payload:
+                self._install_fixture(payload)
+                return self._export()
+        except Exception:
+            self._restore_state(saved)
+            raise
 
         raise validation_error(
             "import payload must contain at least one of 'users', 'balances', 'seeded_total'"
         )
+
 
     def _install_full_export(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Restore a snapshot verbatim. Seed users first, then overlay the rest."""
@@ -862,6 +922,60 @@ class Store:
                 "created_at": record.get("created_at") or now_iso(),
             }
         self.idempotency = restored_idem
+
+        # Stage-2 holds must survive the round trip: an exported authorization
+        # that was dropped here would silently un-reserve its money and let the
+        # payer spend the same funds twice.
+        authorizations_payload = payload.get("authorizations") or []
+        if not isinstance(authorizations_payload, list):
+            raise validation_error("export 'authorizations' must be a list")
+        restored_auth: dict[str, dict[str, Any]] = {}
+        for record in authorizations_payload:
+            if not isinstance(record, dict):
+                raise validation_error("each exported authorization must be an object")
+            record = dict(record)
+            auth_id = record.get("id") or record.get("authorization_id")
+            if not auth_id or not isinstance(auth_id, str):
+                raise validation_error("each exported authorization needs an 'id'")
+            if record.get("status") not in AUTHORIZATION_STATUSES:
+                raise validation_error(
+                    f"exported authorization {auth_id!r} has unknown status {record.get('status')!r}"
+                )
+            for role in ("from", "to"):
+                handle = record.get(role) or record.get(f"{role}_handle")
+                if not isinstance(handle, str) or handle not in self.users:
+                    raise validation_error(
+                        f"exported authorization {auth_id!r} references unknown user {handle!r}",
+                        code="unknown_user",
+                    )
+                record[role] = handle
+                record[f"{role}_handle"] = handle
+            record["id"] = auth_id
+            record.setdefault("captured_amount", 0)
+            record.setdefault("payment_ids", [])
+            restored_auth[auth_id] = record
+        self.authorizations = restored_auth
+
+        # Sessions travel with the snapshot so a signed-in browser stays signed
+        # in. Only tokens naming a restored user are honoured; a token for an
+        # absent handle is dropped rather than resurrecting a phantom login.
+        tokens_payload = payload.get("tokens") or []
+        if not isinstance(tokens_payload, list):
+            raise validation_error("export 'tokens' must be a list")
+        restored_tokens: dict[str, str] = {}
+        for record in tokens_payload:
+            if not isinstance(record, dict):
+                raise validation_error("each exported token must be an object")
+            token, handle = record.get("token"), record.get("handle")
+            if not isinstance(token, str) or not token:
+                raise validation_error("each exported token needs a 'token'")
+            if not isinstance(handle, str) or handle not in self.users:
+                raise validation_error(
+                    f"exported token references unknown user {handle!r}",
+                    code="unknown_user",
+                )
+            restored_tokens[token] = handle
+        self.tokens = restored_tokens
 
         # A restored snapshot must still satisfy every invariant.
         self._check_invariants()

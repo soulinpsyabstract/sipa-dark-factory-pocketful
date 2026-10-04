@@ -1,0 +1,460 @@
+"""Stage-2 import/export tests (W6).
+
+Covers ``GET /_test/export`` and ``POST /_test/import`` against the spec's
+"Existing clients after an upgrade" section: a stage-2 service must accept an
+export produced by the stage-1 service, a browser signed in before the upgrade
+must still be signed in afterwards, pending requests stay payable, a payment
+whose response was lost stays retryable with the same body and key, and a
+rejected import must leave the world untouched.
+
+In-process via ``TestClient``.
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+import sys
+
+import pytest
+from fastapi.testclient import TestClient
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from app.main import app  # noqa: E402
+
+PW = "correct-horse-battery"
+
+USERS = [
+    {"handle": "ada", "email": "ada@example.com", "balance": 2000, "password": PW},
+    {"handle": "bob", "email": "bob@example.com", "balance": 0, "password": PW},
+    {"handle": "cyd", "email": "cyd@example.com", "balance": 0, "password": PW},
+]
+
+# The shape stage-1 emits: no authorizations, no tokens, no stage-2 knobs.
+STAGE1_EXPORT = {
+    "status": "ok",
+    "seeded_total": 2000,
+    "users": [dict(u) for u in USERS],
+    "balances": {"ada": 2000, "bob": 0, "cyd": 0},
+    "requests": [],
+    "activity": [],
+    "idempotency": [],
+    "exported_at": "2026-01-01T00:00:00+00:00",
+}
+
+
+@pytest.fixture()
+def client():
+    with TestClient(app) as c:
+        c.post("/_test/reset", json={"seeded_total": 2000, "users": [dict(u) for u in USERS]})
+        yield c
+
+
+def login(client, handle):
+    r = client.post("/auth/login", json={"email": f"{handle}@example.com", "password": PW})
+    assert r.status_code == 200, r.text
+    return r.json()["access_token"]
+
+
+def auth(token, key=None):
+    headers = {"Authorization": f"Bearer {token}"}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+def wallet(client, handle):
+    body = client.get("/me", headers=auth(login(client, handle))).json()
+    return body["total"], body["held"], body["available"]
+
+
+def export(client):
+    return client.get("/_test/export").json()
+
+
+def do_import(client, payload):
+    return client.post("/_test/import", json=payload)
+
+
+# ----------------------------------------------------------------------
+# stage-1 compatibility
+# ----------------------------------------------------------------------
+
+
+def test_a_stage1_export_imports(client):
+    r = do_import(client, STAGE1_EXPORT)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "ok"
+
+
+def test_a_stage1_export_leaves_no_holds_behind(client):
+    do_import(client, STAGE1_EXPORT)
+    assert wallet(client, "ada") == (2000, 0, 2000)
+
+
+def test_a_bare_fixture_import_still_clears_stage2_state(client):
+    token = login(client, "ada")
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 500},
+        headers=auth(token, "k1"),
+    )
+    assert wallet(client, "ada")[1] == 500
+
+    do_import(client, {"users": [dict(u) for u in USERS], "seeded_total": 2000})
+    assert wallet(client, "ada") == (2000, 0, 2000)
+
+
+# ----------------------------------------------------------------------
+# sessions survive the upgrade (spec: signed in before, still signed in after)
+# ----------------------------------------------------------------------
+
+
+def test_a_signed_in_browser_stays_signed_in_across_import(client):
+    token = login(client, "ada")
+    assert client.get("/me", headers=auth(token)).status_code == 200
+
+    assert do_import(client, export(client)).status_code == 200
+    assert client.get("/me", headers=auth(token)).status_code == 200
+
+
+def test_every_session_survives_not_just_one(client):
+    ada, bob = login(client, "ada"), login(client, "bob")
+    do_import(client, export(client))
+    assert client.get("/me", headers=auth(ada)).status_code == 200
+    assert client.get("/me", headers=auth(bob)).status_code == 200
+
+
+def test_a_token_naming_an_absent_user_is_refused(client):
+    payload = export(client)
+    payload["tokens"].append({"token": "ghost-token", "handle": "nobody"})
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "unknown_user", r.text
+
+
+# ----------------------------------------------------------------------
+# holds survive the upgrade
+# ----------------------------------------------------------------------
+
+
+def test_an_open_hold_survives_export_and_import(client):
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    assert wallet(client, "ada") == (2000, 800, 1200)
+
+    do_import(client, export(client))
+    assert wallet(client, "ada") == (2000, 800, 1200)
+
+
+def test_a_restored_hold_still_blocks_spending(client):
+    """The point of restoring the hold: the money must not become spendable."""
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 1800},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    do_import(client, export(client))
+
+    r = client.post(
+        "/payments", json={"to": "cyd", "amount": 500}, headers=auth(login(client, "ada"), "p1")
+    )
+    # 422, not 409: stage-1's accepted contract reports insufficient funds on
+    # POST /payments as 422 (verify_stage1.py pins this), and stage 2 must not
+    # change it. Only the *evaluation* moved, from total to available.
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "insufficient_funds", r.text
+
+
+def test_a_capture_still_works_after_import(client):
+    aid = client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k1"),
+    ).json()["authorization_id"]
+
+    do_import(client, export(client))
+
+    r = client.post(
+        f"/authorizations/{aid}/capture", json=None, headers=auth(login(client, "bob"), "c1")
+    )
+    assert r.status_code == 201, r.text
+    assert wallet(client, "ada") == (1200, 0, 1200)
+    assert wallet(client, "bob") == (800, 0, 800)
+
+
+def test_capture_history_survives(client):
+    aid = client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k1"),
+    ).json()["authorization_id"]
+    client.post(
+        f"/authorizations/{aid}/capture",
+        json={"amount": 300, "final": False},
+        headers=auth(login(client, "bob"), "c1"),
+    )
+
+    do_import(client, export(client))
+
+    body = client.get(f"/authorizations/{aid}", headers=auth(login(client, "ada"))).json()
+    assert body["status"] == "open", body
+    assert body["captured_amount"] == 300
+    assert body["remaining_amount"] == 500
+
+
+def test_a_voided_authorization_stays_voided(client):
+    aid = client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 500},
+        headers=auth(login(client, "ada"), "k1"),
+    ).json()["authorization_id"]
+    client.post(f"/authorizations/{aid}/void", headers=auth(login(client, "ada")))
+
+    do_import(client, export(client))
+
+    body = client.get(f"/authorizations/{aid}", headers=auth(login(client, "ada"))).json()
+    assert body["status"] == "voided"
+    assert wallet(client, "ada") == (2000, 0, 2000)
+
+
+def test_an_authorization_with_an_unknown_status_is_refused(client):
+    payload = export(client)
+    payload["authorizations"] = [
+        {
+            "id": "a_x",
+            "from": "ada",
+            "to": "bob",
+            "amount": 10,
+            "status": "teleported",
+        }
+    ]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+
+
+def test_an_authorization_naming_an_absent_user_is_refused(client):
+    payload = export(client)
+    payload["authorizations"] = [
+        {"id": "a_x", "from": "ada", "to": "nobody", "amount": 10, "status": "open"}
+    ]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "unknown_user", r.text
+
+
+# ----------------------------------------------------------------------
+# pending requests and lost payment responses (spec, upgrade section)
+# ----------------------------------------------------------------------
+
+
+def test_a_pending_request_is_still_payable_after_import(client):
+    """The `to` party pays, so bob needs funds before he can settle it."""
+    ada = login(client, "ada")
+    rid = client.post(
+        "/requests", json={"to": "bob", "amount": 250}, headers=auth(ada, "r1")
+    ).json()["id"]
+    client.post("/payments", json={"to": "bob", "amount": 500}, headers=auth(ada, "seed1"))
+
+    do_import(client, export(client))
+
+    r = client.post(f"/requests/{rid}/pay", headers=auth(login(client, "bob"), "pay1"))
+    assert r.status_code == 200, r.text
+    assert wallet(client, "ada") == (1750, 0, 1750)
+    assert wallet(client, "bob") == (250, 0, 250)
+
+
+def test_a_lost_payment_response_is_retryable_after_import(client):
+    """Same body and key, and the money moves exactly once."""
+    ada = login(client, "ada")
+    body = {"to": "bob", "amount": 300}
+    first = client.post("/payments", json=body, headers=auth(ada, "p1"))
+    assert first.status_code == 200, first.text
+    payment_id = first.json()["payment_id"]
+
+    do_import(client, export(client))
+
+    retry = client.post("/payments", json=body, headers=auth(ada, "p1"))
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["payment_id"] == payment_id
+    # once only
+    assert wallet(client, "ada") == (1700, 0, 1700)
+    assert wallet(client, "bob") == (300, 0, 300)
+
+
+def test_a_retry_after_import_still_rejects_a_changed_body(client):
+    ada = login(client, "ada")
+    client.post("/payments", json={"to": "bob", "amount": 300}, headers=auth(ada, "p1"))
+    do_import(client, export(client))
+
+    r = client.post("/payments", json={"to": "bob", "amount": 301}, headers=auth(ada, "p1"))
+    assert r.status_code == 409, r.text
+    assert r.json()["code"] == "idempotency_key_reuse", r.text
+
+
+def test_a_restored_authorization_replay_does_not_move_money_twice(client):
+    aid = client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 400},
+        headers=auth(login(client, "ada"), "k1"),
+    ).json()["authorization_id"]
+
+    first = client.post(
+        f"/authorizations/{aid}/capture", json=None, headers=auth(login(client, "bob"), "c1")
+    )
+    assert first.status_code == 201, first.text
+
+    do_import(client, export(client))
+
+    replay = client.post(
+        f"/authorizations/{aid}/capture", json=None, headers=auth(login(client, "bob"), "c1")
+    )
+    assert replay.status_code == first.status_code, replay.text
+    assert replay.json()["payment_id"] == first.json()["payment_id"]
+    assert wallet(client, "bob") == (400, 0, 400)
+
+
+# ----------------------------------------------------------------------
+# round trip
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["balances", "requests", "authorizations", "activity", "idempotency", "currency", "minor_units"],
+)
+def test_export_import_export_round_trips_each_field(client, field):
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 700},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    client.post(
+        "/payments", json={"to": "bob", "amount": 100}, headers=auth(login(client, "ada"), "p1")
+    )
+
+    first = export(client)
+    do_import(client, first)
+    second = export(client)
+    assert second[field] == first[field], f"{field} did not round-trip"
+
+
+def test_tokens_round_trip(client):
+    login(client, "ada")
+    first = export(client)
+    do_import(client, first)
+    assert export(client)["tokens"] == first["tokens"]
+
+
+def test_invariants_hold_after_import(client):
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 700},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    do_import(client, export(client))
+    inv = client.get("/_test/export").json()["invariants"]
+    assert [k for k, v in inv.items() if v is False] == []
+
+
+# ----------------------------------------------------------------------
+# a rejected import must change nothing
+# ----------------------------------------------------------------------
+
+
+def _busy_world(client):
+    """A world with something in every bucket, so a partial write is visible."""
+    ada = login(client, "ada")
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 700},
+        headers=auth(ada, "k1"),
+    )
+    client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(ada, "p1"))
+    client.post("/requests", json={"to": "bob", "amount": 50}, headers=auth(ada, "r1"))
+    return ada
+
+
+def _state(client):
+    snap = export(client)
+    return {
+        "balances": snap["balances"],
+        "requests": len(snap["requests"]),
+        "authorizations": len(snap["authorizations"]),
+        "activity": len(snap["activity"]),
+        "idempotency": len(snap["idempotency"]),
+        "tokens": len(snap["tokens"]),
+    }
+
+
+@pytest.mark.parametrize(
+    "poison",
+    [
+        pytest.param(lambda p: p["requests"].append({"id": "r_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}), id="request-unknown-user"),
+        pytest.param(lambda p: p["requests"].append({"id": "r_x", "from": "ada", "to": "bob", "amount": 1, "status": "levitating"}), id="request-unknown-status"),
+        pytest.param(lambda p: p["activity"].append({"id": "a_x", "handle": "ghost", "type": "payment"}), id="activity-unknown-user"),
+        pytest.param(lambda p: p["idempotency"].append({"user": "ghost", "key": "k", "status_code": 200, "body": {}}), id="idempotency-unknown-user"),
+        pytest.param(lambda p: p["authorizations"].append({"id": "a_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}), id="authorization-unknown-user"),
+        pytest.param(lambda p: p["authorizations"].append({"id": "a_x", "from": "ada", "to": "bob", "amount": 1, "status": "teleported"}), id="authorization-unknown-status"),
+        pytest.param(lambda p: p["tokens"].append({"token": "t_x", "handle": "ghost"}), id="token-unknown-user"),
+        pytest.param(lambda p: p.__setitem__("requests", "not-a-list"), id="requests-not-a-list"),
+        pytest.param(lambda p: p.__setitem__("authorizations", {"nope": 1}), id="authorizations-not-a-list"),
+        pytest.param(lambda p: p.__setitem__("tokens", 7), id="tokens-not-a-list"),
+    ],
+)
+def test_a_rejected_import_changes_nothing(client, poison):
+    """A 422 must never leave a half-replaced world behind."""
+    token = _busy_world(client)
+    before = _state(client)
+
+    payload = export(client)
+    # Move the money somewhere else first, so a partial fixture install that
+    # lands before validation fails is unmistakable.
+    payload["balances"] = {"ada": 1111, "bob": 889, "cyd": 0}
+    poison(payload)
+
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+    assert _state(client) == before
+
+
+def test_a_rejected_import_leaves_the_session_working(client):
+    token = _busy_world(client)
+    payload = export(client)
+    payload["authorizations"].append(
+        {"id": "a_x", "from": "ada", "to": "ghost", "amount": 1, "status": "open"}
+    )
+    assert do_import(client, payload).status_code == 422
+    assert client.get("/me", headers=auth(token)).status_code == 200
+
+
+def test_a_rejected_import_leaves_the_world_usable(client):
+    """After a rejected import the store must still pass its own invariants."""
+    _busy_world(client)
+    payload = export(client)
+    payload["tokens"].append({"token": "t_x", "handle": "ghost"})
+    assert do_import(client, payload).status_code == 422
+
+    r = client.post(
+        "/payments", json={"to": "cyd", "amount": 10}, headers=auth(login(client, "ada"), "p9")
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_a_non_object_payload_is_refused(client):
+    _busy_world(client)
+    before = _state(client)
+    assert do_import(client, [1, 2, 3]).status_code == 422
+    assert _state(client) == before
+
+
+def test_a_payload_with_nothing_recognisable_is_refused(client):
+    _busy_world(client)
+    before = _state(client)
+    r = do_import(client, {"unrelated": "thing"})
+    assert r.status_code == 422, r.text
+    assert _state(client) == before
