@@ -1,0 +1,151 @@
+SELF-RUN EVIDENCE - commit 1f94fcb, image sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+================================================================================
+
+STATUS: CLAIMS TO BE TESTED. Nothing in this file is a gate. These are the
+builder's own measurements, recorded so Core can reproduce or contradict them.
+Per the standing rule, no count here is predicted or hedged; every number is
+literal output from a command the builder executed.
+
+--------------------------------------------------------------------------------
+0. WHAT THIS ARTIFACT IS
+--------------------------------------------------------------------------------
+Core's sec4 ruling was to split W7 so the security fix is provable alone, with
+no UI wave attached. This artifact is that isolated fix.
+
+  branch  w7-token-only
+  commit  1f94fcb  "Stage 2 W7: honour a legacy payload's tokens key for compatibility"
+  parent  1601616  "Stage 2 W6: keep bearer tokens out of the export entirely"
+  how     git cherry-pick 05f7d8d onto 1601616
+
+Core's W7 spec, and where each clause lives:
+
+  _export() drops `tokens`                              -> 1601616
+  import preserves self.tokens filtered to present
+    handles when the key is absent                      -> 1601616
+  import honours the key when present                   -> 1f94fcb (this commit)
+  three tests                                            -> 1601616 + 1f94fcb
+
+--------------------------------------------------------------------------------
+1. SEC F IS PROVABLY ABSENT FROM THIS ARTIFACT
+--------------------------------------------------------------------------------
+  git diff 1601616 HEAD --name-only -- stage-2/app/routers/operations.py
+  operations.py untouched: sec F is NOT in this artifact
+
+Core asked for the security fix to be gateable without sec F riding along. The
+only files this branch changes relative to 1601616 are:
+
+  stage-2/app/store.py                      | 43 +++++++++++----
+  stage-2/tests/test_stage2_importexport.py | 92 +++++++++++++++++++++++++------
+
+--------------------------------------------------------------------------------
+2. NO DIVERGENT CODE PATH - this branch is a gate artifact, not a fork
+--------------------------------------------------------------------------------
+Per Core's sec5 rule (the gated image must contain the complete suite as of the
+gated commit), the token logic must reach the final tip. It does, byte-identical:
+
+  1f94fcb:stage-2/app/store.py                     == 05f7d8d  IDENTICAL (64be8b1)
+  1f94fcb:stage-2/tests/test_stage2_importexport.py == 05f7d8d  IDENTICAL (c89ba12)
+
+1f94fcb is not an ancestor of main; its blobs are already on main via 05f7d8d.
+No orphan test-only commit exists in the repo.
+
+--------------------------------------------------------------------------------
+3. ARTIFACT INTEGRITY
+--------------------------------------------------------------------------------
+  BLOB_HASH  26 compared, 0 mismatches
+
+26, not 27: this artifact has no test_stage2_idempotency_bytes.py, because sec F
+is absent. The count differing from w7b is itself the evidence that sec F is not
+present.
+
+  built from a clean `git archive --format=zip` export of 1f94fcb, expanded with
+  Expand-Archive. No tar pipe, no working-tree contamination.
+
+  image used : sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+  created    : 2026-10-05T01:45:23.664077655Z
+
+  ID re-read AFTER all gates, by ID and by tag, unchanged:
+    by-id       sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+    tag w7-token sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+
+  Nothing pruned. Every prior tag retained.
+
+--------------------------------------------------------------------------------
+4. CORE'S THREE W7 LEGS, verbatim, on this artifact
+--------------------------------------------------------------------------------
+  health: {"status":"ok"}
+    (a) tokens key in export: False | ada's token string anywhere: False
+    (b) session survives: 200 -> /me 200
+    (c) removed user session: import 200 -> /me 401 (must be 401)
+
+  (a) no credential material in any export
+  (b) SPEC line 151 - browser stays signed in across an in-place upgrade
+  (c) a deprovisioned user's session cannot be resurrected by an import
+
+--------------------------------------------------------------------------------
+5. TEST BATTERY
+--------------------------------------------------------------------------------
+  HOST_SUITE     263 passed, 1 xfailed in 216.00s (0:03:36)
+  IMAGE_SUITE    263 passed, 1 xfailed, 1 warning in 152.02s (0:02:32)
+                 (run with --network none)
+  STAGE1_HARNESS 174 passed, 0 failed
+
+The 1 xfail is the known imported-request-amount validation gap, unrelated to
+this wave, tracked rather than silenced.
+
+--------------------------------------------------------------------------------
+6. THE RED LEG - proof these tests can fail
+--------------------------------------------------------------------------------
+Core's sec2 method, applied to sec G, which had never had it. Core bind-mounted
+new tests onto old W5 code so the vulnerable code ran the new suite. The token
+tests had never been watched going red. So the builder did it against w6, which
+is the artifact that still carries the token-export defect:
+
+  image: w6 / 01bf6c15cc94
+    export has 'tokens' key      : True
+    live bearer token in payload : True
+
+w6 passes the three hold tests (it fixed hold-release) and fails the token tests.
+Two defects, two waves, one image - which is why w6 must never be called FIXED.
+
+--------------------------------------------------------------------------------
+7. AUTHORITATIVE TAG STATE
+--------------------------------------------------------------------------------
+Tag state was carried forward in chat prose three times and was wrong every time.
+This table is generated by `python verify/tagstate.py`, which reads the Docker
+daemon directly. Do not trust a recalled table; run the script.
+
+TAG                 IMAGE ID (sha256)                                    NOTE
+----------------------------------------------------------------------------------
+latest               sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+                                                                     banned as gate target
+w4                   sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114
+                                                                     no void route; UNGATED
+w4-verify            sha256:ad54b473f333362ec97c11fd889db7d7c4c663b2cfb7b67afb141414c853cc49
+w5                   sha256:4eeb3e45fc851b109da4ede15a54b41e8735e3b96a32596e405c7733e99fa740
+                                                                     double-spend; never ship
+w6                   sha256:01bf6c15cc9424980dbb90c5a25b33df5cd8c0bb5cca8d47505be687b62feba3
+                                                                     exports tokens; UNGATED
+w6b                  sha256:b693eed4a6ef8e39b4e22d70b03b00a8abf3ba29b7ff7a3d6c8b51971f71c39e
+w6c                  sha256:980c679f1f76f2354e0e6805529ffc233843151cc53189d505e8ea06ea6e455e
+w7                   sha256:15b06fff3b7c67f12b3375f5ff0934998fa3157996dbb62f696d02c7a858d046
+                                                                     sec F
+w7-token             sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741
+                                                                     sec G alone
+w7b                  sha256:594701ccf565f145bfb6fe88798c02c769c4cf80f29a98371bdd9c4d9e3a6b1e
+                                                                     sec F + sec G
+
+HEAD commit: 6a9ed09  Rename withdrawn W4 verdict so no live-looking gate remains
+
+--------------------------------------------------------------------------------
+8. KNOWN GAPS CARRIED FORWARD (not closed by this wave)
+--------------------------------------------------------------------------------
+- Imported pending-request `amount` lacks type/sign/presence validation.
+  Tracked by a strict xfail. Unruled.
+- Stage-1-shaped imports omit `authorizations`, so existing holds are released
+  while sessions survive. Unruled.
+- SPEC line 328 requires 200 with current state on repeat void; a ruling was
+  phrased as `already_voided`. Unresolved, implementation follows SPEC.
+
+================================================================================
+END. Not a verdict. Not a gate. Builder's own claims, for Core to test.
