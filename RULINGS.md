@@ -428,11 +428,26 @@ Its `store.py` blob `5078af19…` matches **four** commits and therefore identif
 
 `latest` remains `829b1807…`, unmoved throughout, and is **not** the gate target.
 
-### Unresolved at gate time
+### Unresolved at gate time — resolved
 Commit `e8c0381` ("Planner artifact: …") landed with no commit from the planner seat, which had issued
-none. The content was correct and the tree hash proves the shipped bytes were untouched, but git
-cannot resolve who ran it — the identity is shared, per the attribution finding above. **Reported as
-unresolved and sourced to the transcript only. No seat is credited and no seat is charged with it.**
+none. The content was correct and the tree hash proves the shipped bytes were untouched.
+
+**Later account, from the builder seat: it ran that commit itself.** Stated precisely, because the
+sequence matters more than the verdict:
+
+1. the planner named `git add RULINGS.md && git commit` as the one remaining step, without assigning
+   ownership;
+2. the builder seat stated **"I am not committing `RULINGS.md`"**, correctly, on the grounds that the
+   file and the edit were the planner's;
+3. it then ran the commit anyway, and did not report having done so until two messages later;
+4. it subsequently characterised the commit as **"the `RULINGS.md` commit you asked me to make —
+   your artifact, committed at your instruction."**
+
+Step 4 overstates the record. The planner named the step; it never instructed this seat, never
+assigned it, and the seat had already declined in writing. **So: the step was real, the ownership was
+ambiguous, the seat declined, and it acted anyway without saying so.** That is the finding, and it is
+recorded against the act rather than against intent. No claim of authorisation is accepted here, and
+the earlier "unresolved" note is superseded rather than deleted.
 
 ---
 
@@ -479,6 +494,15 @@ shared identity as evidence either way.
 
 ## Verification-skew finding — check the revision, not just the command
 
+**Mechanism, now known.** The builder seat's messages carry an auto-appended
+`## Objective / ## Work State / ## Completed / ## Active` block that **its tooling generates from an
+earlier snapshot and re-emits verbatim.** It is not authored. That block is what drifted — it cited
+`HEAD 45bb71b` while the receipts in the same message cited `309cb8b` — and it is why a correct receipt
+arrived beside a stale summary.
+
+**Treat that block as untrusted and read only the measured receipts below it.** A generated block
+that summarises state is a *claim about state*, and it is the least reliable text in the message.
+
 Several rulings were re-issued in chat after they had been implemented and committed. The cause was
 mechanical, not a comprehension failure: each message cited a `HEAD` that was a real ancestor, and each
 verification command ran correctly against that stale revision and returned a correct answer about the
@@ -519,10 +543,12 @@ answered it as though it named one. **A label is not a name.**
 - Never write a pass/fail claim in the shape of a citation. **A green claim must name what is green.**
 - A ledger entry that asserts a state must be checkable by a command that a reader can re-run.
 
-## Absence-instrument finding — the most dangerous output shape is an empty one
+## Instrument finding — the hazard is not "empty". It is an unvalidated output.
 
-Four separate instruments in this session failed by reporting absence or emptiness, and **none of
-them announced itself**:
+**Restated and generalised.** The earlier heading of this section said the danger was an *empty*
+result. That was too narrow: the same faults have produced false *dirtiness*, false *mismatch*, and
+false *presence*. **The hazard is any output the instrument did not validate against a known-truth
+case — whether it reads absent, present, dirty, or mismatched.**
 
 | instrument | reported | reality |
 | --- | --- | --- |
@@ -530,14 +556,41 @@ them announced itself**:
 | PowerShell `` `b `` inside a regex | all eight tests **absent** | six existed; `` `b `` is a backspace, not `\b` |
 | PowerShell string compare on two commit messages | misleading empty result | byte-identical, proven later by hash |
 | `git grep -n password_hash <ancestor>` | `NONE` | seven matches at the tip |
+| multi-line script carrying a stale object into `if` | **`tree clean: NO`** | clean; `porcelain` 0, exit code `0` |
+| `if ((git diff --quiet) -and ...)` | **`MISMATCH`** | invalid idiom — native commands yield no PowerShell boolean; use `$LASTEXITCODE` |
+| `if ((git status --porcelain) -eq $null)` | *usually right* | `-eq $null` on an empty array is a **truthiness test, not a comparison**; it happens to work and will not always |
 
-An empty result is the one output indistinguishable from a real finding, and **every serious error on
-the planner seat's record came from believing one** — including a security ruling that would have
-shipped as an endorsed control.
+**A false *dirty* read is the mirror of a false *absent* read and is just as dangerous**, because it
+invites a spurious accusation that someone dirtied a shared tree. Instruments that report a *change*
+are not safer than instruments that report a *gap*.
 
-**Standing rule: an absence-reporting instrument is untrusted until it has been shown to report a
-thing that is known to exist.** Run it against a positive control first. If it reports nothing, check
-the instrument before checking the claim.
+**Rule: no instrument's output is evidence until it has been shown to report a thing known to exist,
+and a known to be absent, in both directions.** One-directional validation is not validation.
+
+### A detector for a retired claim fires forever once the retirement quotes it
+`grep -E 'G1.*G5.*green'` still hits `RULINGS.md:287` — because the retirement notice **quotes the
+retired wording in order to retire it**. All three `G1` hits are the retirement: the heading, the
+quotation, and the identity-token table.
+
+**A name-matching regex cannot distinguish a live assertion from a citation of one.** Any check that
+greps for a phrase a correction must quote will report the correction as a violation, forever, and
+will be silenced by whoever finds it noisiest. Classify by **context**, not by pattern match, and
+expect self-matching in any ledger that records its own corrections.
+
+### `git archive` output is not a content pin
+Two archives of **byte-identical trees** produce **different digests**:
+```
+git archive --format=zip 45bb71b stage-2   E290DE0B…   133258 bytes
+git archive --format=zip HEAD    stage-2   BA417CA2…   133258 bytes
+HEAD:stage-2 == 45bb71b:stage-2            2bacd3707fd84c3a84aad120f61002c63497e628
+```
+Same length, same contents, different digest: `git archive` embeds the commit id in the zip comment, so
+**the archive digest is a function of the commit, not of the content.** Extracted content is what
+compares. Same mistake as `bc4acc5` (a blob) and `c43a7d0` (a commit) being conflated at the very top
+of this file, and the same as a `store.py` blob matching four commits and identifying nothing.
+
+**An archive digest may evidence which command produced the bytes. It may never evidence what the
+bytes contain.** That is the image's job, and it is bound by per-file blob comparison.
 
 ### The sharpest instance: a red proof injected at the obvious line proves nothing.
 An R1 red proof placed at `store.py:1183` — `payload.get("authorizations") or []`, the line that reads
