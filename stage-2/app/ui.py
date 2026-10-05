@@ -230,14 +230,22 @@ def _wallet_numbers(user: dict, *, headline_available: bool) -> str:
     return f'<div class="grid3">{"".join(cells)}</div>'
 
 
-def render_signed_out() -> str:
+def render_signed_out(auth_error: str = "") -> str:
     """The signed-out landing page.
 
     A browser following a bare link sends no bearer token. Returning 401 for
     ``Accept: text/html`` would make negotiation look broken, so this renders
     a sign-in prompt instead. No ``current-user`` testid: the spec scopes that
     to "when signed in".
+
+    ``auth-error`` is emitted only when there is one, per the spec's wording,
+    so its mere presence is never mistaken for a failure.
     """
+    err = (
+        f'<p class="err" data-testid="auth-error" role="alert">{esc(auth_error)}</p>'
+        if auth_error
+        else ""
+    )
     body = (
         '<section class="card"><h1>Pocketful</h1>'
         '<p class="secondary">Sign in to see your balance, pay someone, '
@@ -249,11 +257,130 @@ def render_signed_out() -> str:
         '<label for="login-password">Password</label>'
         '<input id="login-password" data-testid="login-password" name="password" '
         'type="password" autocomplete="current-password">'
-        '<div><button type="submit" data-testid="login-submit">Sign in</button></div>'
-        '<p class="err" data-testid="auth-error" role="alert"></p>'
+        f'<div><button type="submit" data-testid="login-submit">Sign in</button></div>'
+        f"{err}"
+        '<p class="secondary">No account yet? <a href="/signup">Create one</a>.</p>'
         "</form></section>"
     )
     return _layout("Sign in", body, None, None)
+
+
+def render_login(auth_error: str = "", email: str = "") -> str:
+    """``/login`` as its own route, so the spec's route table is honoured."""
+    err = (
+        f'<p class="err" data-testid="auth-error" role="alert">{esc(auth_error)}</p>'
+        if auth_error
+        else ""
+    )
+    body = (
+        '<section class="card"><h1>Sign in</h1>'
+        '<form method="post" action="/ui/login">'
+        '<label for="login-email">Email</label>'
+        f'<input id="login-email" data-testid="login-email" name="email" type="email" '
+        f'autocomplete="username" value="{esc(email)}">'
+        '<label for="login-password">Password</label>'
+        '<input id="login-password" data-testid="login-password" name="password" '
+        'type="password" autocomplete="current-password">'
+        f'<div><button type="submit" data-testid="login-submit">Sign in</button></div>'
+        f"{err}"
+        '<p class="secondary">No account yet? <a href="/signup">Create one</a>.</p>'
+        "</form></section>"
+    )
+    return _layout("Sign in", body, None, None)
+
+
+def render_signup(
+    auth_error: str = "", email: str = "", display_name: str = ""
+) -> str:
+    err = (
+        f'<p class="err" data-testid="auth-error" role="alert">{esc(auth_error)}</p>'
+        if auth_error
+        else ""
+    )
+    body = (
+        '<section class="card"><h1>Create your account</h1>'
+        '<form method="post" action="/ui/signup">'
+        '<label for="signup-email">Email</label>'
+        f'<input id="signup-email" data-testid="signup-email" name="email" type="email" '
+        f'autocomplete="username" value="{esc(email)}">'
+        '<label for="signup-display-name">Display name</label>'
+        f'<input id="signup-display-name" data-testid="signup-display-name" '
+        f'name="display_name" value="{esc(display_name)}">'
+        '<label for="signup-password">Password</label>'
+        '<input id="signup-password" data-testid="signup-password" name="password" '
+        'type="password" autocomplete="new-password">'
+        f'<div><button type="submit" data-testid="signup-submit">Create account</button></div>'
+        f"{err}"
+        '<p class="secondary">Already registered? <a href="/login">Sign in</a>.</p>'
+        "</form></section>"
+    )
+    return _layout("Sign up", body, None, None)
+
+
+def render_split(
+    user: dict,
+    *,
+    amount: str = "",
+    handles: str = "",
+    note: str = "",
+    shares: list[dict] | None = None,
+    split_error: str = "",
+    nonce: str = "",
+) -> str:
+    """``/split``: the form plus a preview of the shares before posting.
+
+    ``shares`` is computed by the caller with ``operations.split_shares`` - the
+    same function ``POST /splits`` uses - so the preview cannot disagree with
+    what the server will actually do.
+    """
+    cur = str(user.get("currency", "EUR"))
+    mu = int(user.get("minor_units", 2))
+    if shares is None:
+        preview = (
+            '<p class="secondary" data-testid="split-preview">Enter an amount and '
+            "the handles, in order, to see each share.</p>"
+        )
+    else:
+        rows = "".join(
+            f'<li><span class="money" data-testid="split-share-{esc(str(s["handle"]))}">'
+            f"{esc(format_amount(int(s['amount']), cur, mu))}</span>"
+            f'<span class="secondary"> to {esc(str(s["handle"]))}</span></li>'
+            for s in shares
+        )
+        preview = f'<ul class="list" data-testid="split-preview">{rows}</ul>'
+
+    err = (
+        f'<p class="err" data-testid="split-error" role="alert">{esc(split_error)}</p>'
+        if split_error
+        else ""
+    )
+    form = (
+        '<h2>Split a bill</h2>'
+        f'<form method="get" action="/split" data-testid="split-preview-form">'
+        '<label for="split-amount">Amount</label>'
+        f'<input id="split-amount" data-testid="split-amount" name="amount" '
+        f'placeholder="15.00" value="{esc(amount)}">'
+        '<label for="split-handles">Handles, in order</label>'
+        f'<input id="split-handles" data-testid="split-handles" name="handles" '
+        f'placeholder="ada, bob, cy" value="{esc(handles)}">'
+        '<label for="split-note">Note (optional)</label>'
+        f'<input id="split-note" data-testid="split-note" name="note" '
+        f'value="{esc(note)}">'
+        '<div><button type="submit" data-testid="split-preview-submit">'
+        "Preview shares</button></div>"
+        "</form>"
+        + preview
+        + '<form method="post" action="/ui/split">'
+        + _hidden("nonce", nonce)
+        + _hidden("amount", amount)
+        + _hidden("handles", handles)
+        + _hidden("note", note)
+        + f'<div><button type="submit" data-testid="split-submit">'
+        f"Send the split</button></div>"
+        f"{err}"
+        + "</form>"
+    )
+    return _layout("Split", f'<section class="card">{form}</section>', user, None)
 
 
 def _hidden(name: str, value: str) -> str:

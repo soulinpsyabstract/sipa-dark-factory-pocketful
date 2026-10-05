@@ -486,6 +486,29 @@ def list_requests(
 # ======================================================================
 
 
+def split_shares(amount: int, participants: list[str]) -> list[dict[str, Any]]:
+    """The Stage-1 A9 division rule, in one place.
+
+    ``base, remainder = divmod(amount, len(participants))`` and the first
+    ``remainder`` participants in the list get ``base + 1``. So 100/3 is
+    ``[34, 33, 33]`` and 10/4 is ``[3, 3, 2, 2]``.
+
+    SPEC requires ``split-preview`` to show the shares the *server* would
+    compute, before anything is posted. The preview and the write therefore
+    both call this function rather than each re-deriving the rule, so they
+    cannot drift apart.
+    """
+    if not participants:
+        raise validation_error(
+            "a split needs at least one participant", code="no_participants"
+        )
+    base, remainder = divmod(amount, len(participants))
+    return [
+        {"handle": handle, "amount": base + (1 if index < remainder else 0)}
+        for index, handle in enumerate(participants)
+    ]
+
+
 @router.post("/splits")
 def create_split(body: SplitIn, request: Request, raw: RawBody, me: CurrentUser) -> JSONResponse:
     """Split ``amount`` equally across an ordered participant list.
@@ -519,12 +542,7 @@ def create_split(body: SplitIn, request: Request, raw: RawBody, me: CurrentUser)
                 "participants must be unique", code="duplicate_participants"
             )
 
-        count = len(participants)
-        base, remainder = divmod(body.amount, count)
-        parts = [
-            {"handle": handle, "amount": base + (1 if index < remainder else 0)}
-            for index, handle in enumerate(participants)
-        ]
+        parts = split_shares(body.amount, participants)
 
         # Validate every debit before moving a single unit. Debits are measured
         # against *available* (balance minus holds), so funds reserved by an open

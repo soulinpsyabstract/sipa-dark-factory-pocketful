@@ -41,7 +41,9 @@ from .operations import (
     cancel_request,
     create_payment,
     create_request,
+    create_split,
     decline_request,
+    split_shares,
     pay_request,
 )
 
@@ -177,22 +179,47 @@ def ui_login(
         response = login(LoginIn(email=email, password=password))
     except AppError as exc:
         message = _error_text(exc) or "sign in failed"
-        return _with_error(ui.render_signed_out(), message)
+        return _html(ui.render_login(message, email))
     token = json.loads(response.body).get("access_token")
     if not token:
-        return _with_error(ui.render_signed_out(), "sign in failed")
+        return _html(ui.render_login("sign in failed", email))
     r = RedirectResponse("/", status_code=303)
     r.set_cookie(SESSION, token, httponly=True, samesite="lax", path="/")
     return r
 
 
-def _with_error(body: str, message: str) -> Any:
+@router.post("/ui/signup")
+def ui_signup(
+    request: Request,
+    email: Annotated[str, Form()],
+    password: Annotated[str, Form()],
+    display_name: Annotated[str, Form()] = "",
+):
+    from ..schemas import SignupIn
+    from .auth import signup
+
+    try:
+        response = signup(
+            SignupIn(email=email, password=password, display_name=display_name or None)
+        )
+    except AppError as exc:
+        message = _error_text(exc) or "sign up failed"
+        return _html(ui.render_signup(message, email, display_name))
+    token = json.loads(response.body).get("access_token")
+    if token:
+        r = RedirectResponse("/", status_code=303)
+        r.set_cookie(SESSION, token, httponly=True, samesite="lax", path="/")
+        return r
+    # POST /auth/signup deliberately mints no token (Stage-1 logs in
+    # separately), so there is no session to hand the browser yet. Sending the
+    # new account straight to the login form is the honest outcome.
+    return RedirectResponse("/login", status_code=303)
+
+
+def _html(body: str) -> Any:
     from fastapi.responses import HTMLResponse
 
-    marker = 'data-testid="auth-error" role="alert">'
-    return HTMLResponse(
-        body.replace(marker, marker + ui.esc(message)), status_code=200
-    )
+    return HTMLResponse(body, status_code=200)
 
 
 @router.post("/ui/logout")
@@ -443,3 +470,130 @@ def ui_void(request: Request, authorization_id: str, nonce: Annotated[str, Form(
             {"authorization_error": _error_text(exc)},
         )
     return _redirect("/authorizations", {})
+
+
+# ----------------------------------------------------------------------
+# signup, login and split - the routes the spec's table lists alongside the
+# three API-backed screens. These are browser-only: they have no JSON
+# counterpart to negotiate against, so they serve HTML unconditionally rather
+# than pretending to have a JSON branch.
+# ----------------------------------------------------------------------
+
+
+def _user_or_none(handle: str | None) -> dict | None:
+    if not handle:
+        return None
+    user = store.read(lambda: store.users.get(handle))
+    if user is None:
+        return None
+    return store.read(
+        lambda: _user_public(
+            user,
+            store.balances,
+            store._funds(handle),
+            store.currency,
+            store.minor_units,
+        )
+    )
+
+
+@router.get("/signup")
+def page_signup(request: Request):
+    q = request.query_params
+    return _html(
+        ui.render_signup(
+            q.get("auth_error", ""), q.get("email", ""), q.get("display_name", "")
+        )
+    )
+
+
+@router.get("/login")
+def page_login(request: Request):
+    q = request.query_params
+    return _html(ui.render_login(q.get("auth_error", ""), q.get("email", "")))
+
+
+@router.get("/split")
+def page_split(request: Request):
+    from ..dependencies import get_ui_user
+
+    try:
+        handle = get_ui_user(
+            request,
+            request.headers.get("authorization"),
+            request.headers.get("x-auth-token"),
+        )
+    except AppError:
+        return _html(ui.render_login("sign in to split a bill"))
+    user = _user_or_none(handle)
+    if user is None:
+        return _html(ui.render_login("sign in to split a bill"))
+
+    q = request.query_params
+    amount_raw = q.get("amount", "")
+    handles_raw = q.get("handles", "")
+    note = q.get("note", "")
+    shares = None
+    error = q.get("split_error", "")
+    if amount_raw.strip() and handles_raw.strip():
+        handles = [h.strip() for h in handles_raw.split(",") if h.strip()]
+        minor, parse_error = _form_amount(amount_raw)
+        if parse_error:
+            error = parse_error
+        elif not handles:
+            error = "name at least one handle, comma separated"
+        elif len(set(handles)) != len(handles):
+            error = "handles must be unique"
+        else:
+            try:
+                # Same function POST /splits uses, so the preview cannot lie
+                # about what the write will do.
+                shares = split_shares(int(minor), handles)
+            except AppError as exc:
+                error = _error_text(exc)
+    return _html(
+        ui.render_split(
+            user,
+            amount=amount_raw,
+            handles=handles_raw,
+            note=note,
+            shares=shares,
+            split_error=error,
+            nonce=new_nonce(),
+        )
+    )
+
+
+@router.post("/ui/split")
+def ui_split(
+    request: Request,
+    amount: Annotated[str, Form()] = "",
+    handles: Annotated[str, Form()] = "",
+    note: Annotated[str, Form()] = "",
+    nonce: Annotated[str, Form()] = "",
+):
+    from ..schemas import SplitIn
+
+    me = _require_ui_user(request)
+    participants = [h.strip() for h in handles.split(",") if h.strip()]
+    kept = {"amount": amount, "handles": handles, "note": note}
+    minor, error = _form_amount(amount)
+    if error:
+        return _redirect("/split", {**kept, "split_error": error})
+    if not participants:
+        return _redirect(
+            "/split", {**kept, "split_error": "name at least one handle, comma separated"}
+        )
+    payload = {"amount": minor, "participants": participants, "note": note or None}
+    key = _idempotency_key(nonce, payload)
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    try:
+        create_split(
+            body=SplitIn(amount=minor, participants=participants, note=note or None),
+            request=_shim(request, key),
+            raw=raw,
+            me=me,
+        )
+    except AppError as exc:
+        return _redirect("/split", {**kept, "split_error": _error_text(exc)})
+    return RedirectResponse("/", status_code=303)
