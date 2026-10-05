@@ -24,14 +24,36 @@ router = APIRouter()
 CurrentUser = Annotated[str, Depends(get_current_user)]
 
 
-def _fingerprint(method: str, path: str, payload: Any) -> str:
-    blob = json.dumps(
-        {"method": method, "path": path, "body": payload},
-        sort_keys=True,
-        default=str,
-        separators=(",", ":"),
-    )
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+async def raw_body(request: Request) -> bytes:
+    """The raw request body bytes, for the D6 idempotency fingerprint.
+
+    Starlette caches the body, so FastAPI can still bind the declared model.
+    Fingerprinting the *raw* bytes rather than the validated model is what the
+    spec requires: the request schemas are ``extra="ignore"``, so hashing the
+    model would drop unrecognised fields and treat two genuinely different
+    bodies as the same request - a silent replay where a 409 is owed.
+    """
+    return await request.body()
+
+
+RawBody = Annotated[bytes, Depends(raw_body)]
+
+
+def _fingerprint(method: str, path: str, raw: bytes) -> str:
+    """D6: hash the method, path and *raw* body bytes.
+
+    An absent or blank body is normalised to ``{}`` so a no-body write stays
+    stable across retries that send no body at all. Mirrors
+    ``authorizations.fingerprint`` so all seven write paths agree.
+    """
+    body = raw if raw and raw.strip() else b"{}"
+    digest = hashlib.sha256()
+    digest.update(method.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(path.encode("utf-8"))
+    digest.update(b"\n")
+    digest.update(body)
+    return digest.hexdigest()
 
 
 def _idempotency_key(request: Request) -> str | None:
@@ -59,7 +81,7 @@ def _check_recipient(handle: str, me: str) -> str:
 
 @router.post("/payments")
 def create_payment(
-    body: PaymentIn, request: Request, me: CurrentUser
+    body: PaymentIn, request: Request, raw: RawBody, me: CurrentUser
 ) -> JSONResponse:
     """Move ``amount`` minor units from the caller to ``to``.
 
@@ -68,7 +90,7 @@ def create_payment(
     the whole operation is validated before a single unit moves.
     """
     key = _idempotency_key(request)
-    fingerprint = _fingerprint("POST", "/payments", body.model_dump(mode="json"))
+    fingerprint = _fingerprint("POST", "/payments", raw)
 
     def work() -> tuple[int, dict[str, Any]]:
         replay = store._idem_replay(me, key, fingerprint)
@@ -134,10 +156,10 @@ def create_payment(
 
 
 @router.post("/requests")
-def create_request(body: RequestIn, request: Request, me: CurrentUser) -> JSONResponse:
+def create_request(body: RequestIn, request: Request, raw: RawBody, me: CurrentUser) -> JSONResponse:
     """Ask ``to`` for money. Creates no balance change - funds move on /pay."""
     key = _idempotency_key(request)
-    fingerprint = _fingerprint("POST", "/requests", body.model_dump(mode="json"))
+    fingerprint = _fingerprint("POST", "/requests", raw)
 
     def work() -> tuple[int, dict[str, Any]]:
         replay = store._idem_replay(me, key, fingerprint)
@@ -197,10 +219,10 @@ def _load_request(request_id: str) -> dict[str, Any]:
 
 
 @router.post("/requests/{request_id}/pay")
-def pay_request(request_id: str, request: Request, me: CurrentUser) -> JSONResponse:
+def pay_request(request_id: str, request: Request, raw: RawBody, me: CurrentUser) -> JSONResponse:
     """Recipient fulfils the request; funds move recipient -> creator."""
     key = _idempotency_key(request)
-    fingerprint = _fingerprint("POST", f"/requests/{request_id}/pay", {})
+    fingerprint = _fingerprint("POST", f"/requests/{request_id}/pay", raw)
 
     def work() -> tuple[int, dict[str, Any]]:
         replay = store._idem_replay(me, key, fingerprint)
@@ -442,7 +464,7 @@ def list_requests(
 
 
 @router.post("/splits")
-def create_split(body: SplitIn, request: Request, me: CurrentUser) -> JSONResponse:
+def create_split(body: SplitIn, request: Request, raw: RawBody, me: CurrentUser) -> JSONResponse:
     """Split ``amount`` equally across an ordered participant list.
 
     Division: ``base, remainder = divmod(amount, len(participants))`` and the
@@ -455,7 +477,7 @@ def create_split(body: SplitIn, request: Request, me: CurrentUser) -> JSONRespon
     a balance below zero, or if the payer cannot cover the total charged.
     """
     key = _idempotency_key(request)
-    fingerprint = _fingerprint("POST", "/splits", body.model_dump(mode="json"))
+    fingerprint = _fingerprint("POST", "/splits", raw)
 
     def work() -> tuple[int, dict[str, Any]]:
         replay = store._idem_replay(me, key, fingerprint)
@@ -597,7 +619,7 @@ def activity(
 
 
 @router.post("/settlements")
-def create_settlement(body: SettlementIn, request: Request, me: CurrentUser) -> JSONResponse:
+def create_settlement(body: SettlementIn, request: Request, raw: RawBody, me: CurrentUser) -> JSONResponse:
     """Operator-only settlement batch. All-or-nothing.
 
     403 for any authenticated non-operator. Each transfer is validated up
@@ -606,7 +628,7 @@ def create_settlement(body: SettlementIn, request: Request, me: CurrentUser) -> 
     require_operator(me)
 
     key = _idempotency_key(request)
-    fingerprint = _fingerprint("POST", "/settlements", body.model_dump(mode="json", by_alias=True))
+    fingerprint = _fingerprint("POST", "/settlements", raw)
 
     def work() -> tuple[int, dict[str, Any]]:
         replay = store._idem_replay(me, key, fingerprint)
