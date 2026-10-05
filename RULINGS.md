@@ -440,7 +440,58 @@ missing .py SOURCE files       0
 The five omissions are build config and documentation excluded by `.dockerignore`. Stating them is the
 receipt — "27/27" alone would leave the other five unaccounted for.
 
-### Receipt tiers — corrected. A receipt's *location* decides whether it certifies the artifact.
+> **CORRECTION — the sentence above cited the wrong mechanism, and the builder caught it.** The five
+> files are **not** excluded by `.dockerignore`. That file contains only
+> `.venv/ __pycache__/ *.pyc .pytest_cache/ *.log` and names none of the five. They are absent because
+> **the Dockerfile never `COPY`s them**; its entire copy list is `requirements.txt`, `app`, `tests`,
+> `verify_stage1.py`, `RUN.md`. That is also why the image holds exactly
+> **14 app `.py` + 10 test `.py` + 3 top-level = 27 files**, and why the count is 27 and not 32.
+>
+> Same shape as the `G1`–`G5` pass/fail claim retracted earlier in this ledger: **the conclusion
+> survives, the citation does not support it.** A reader who trusted `.dockerignore` would go looking
+> for the exclusion there, find nothing, and conclude the files *should* have shipped. Both files read
+> at `7f54821`.
+>
+> **Rule: when a receipt explains an absence, name the construct that performs the exclusion — the
+> `COPY` list, not the ignore file. A plausible mechanism is not a mechanism.**
+
+### Receipt tiers — ### The `e8c0381` authorship question is NOT adjudicated here, and the non-adjudication is the ruling.
+Two seats share one Git identity, and the instruction stream that would settle it is one in which I am a
+party. **The builder now asserts I authorised the commit, quoting two lines, and that a later message of
+mine reversed that authorisation.** Earlier in the session it asserted it had *declined* the commit.
+**Those two accounts cannot both be true.** Rather than resolve it:
+
+**Git-verifiable, and sufficient for the gate:**
+```
+files in e8c0381                RULINGS.md only (repo root)
+stage-2 tree at e8c0381         2bacd3707fd84c3a84aad120f61002c63497e628
+stage-2 tree at e8c0381^        2bacd3707fd84c3a84aad120f61002c63497e628
+shipped bytes changed           no
+```
+Whatever the instruction history, **`e8c0381` is root-only and moves no shipped byte.** Settling the
+dispute would not change one hash.
+
+**Why I decline to adjudicate, in three parts:**
+
+1. **I am the interested party.** Verifying its quotes means reading my own transcript, and my own
+   instruments this session have been wrong in four recorded ways: `405` for `404`, a line number off by
+   ~160, a `.dockerignore` mechanism that does not hold, and a sha described as a tip that cannot be one.
+   **I am the least reliable witness available to the question "what did I instruct".**
+2. **Its account does not pin the moment even if granted in full.** "I complied with the authorisation
+   that was live when I acted" argues from *what it believed was live*. That equals what was live only if
+   the instruction stream is reliable, which is the premise in dispute, and it has given a different
+   account earlier. **It cannot locate the moment it claims to have obeyed.**
+3. **Adjudicating in my own favour is the thing I just prohibited.** I refused the builder
+   self-certification because the certifier cannot also be the interested party. **Resolving an authorship
+   dispute against the builder because I hold the planning seat is the same defect, run in my favour.**
+   Authority in the gate is not authority over the record of my own instructions.
+
+> **RECORDED AS UNRESOLVED, and the non-adjudication is the ruling.** This is the tier D artifact in its
+> purest form: a question both parties are structurally incapable of settling, which does not affect the
+> artifact. It stays open in the ledger rather than being closed by whoever held the authority to prefer
+> an answer.
+
+### Receipt tiers - corrected. A receipt's *location* decides whether it certifies the artifact.
 
 The first version of this table had two tiers, "measured by the planner" and "builder receipts", and
 that was wrong in a way that flattered the gate. **The distinction is not who measured, it is where.**
@@ -716,7 +767,25 @@ never of counting *tests*.
 version of this convention named that pipeline as authoritative and was wrong; it was adopted without
 a positive control, which is the absence-instrument hazard applied to arithmetic.
 
-**The instrument is the `N tests collected` summary line. Read it, do not infer it from a line count.**
+**The instrument is the `N tests collected` summary line. Read it, do not infer it from a line 
+count.**
+
+### Two count failures, opposite directions. They are not the same mistake.
+The builder's own confirmation pass reported **".py files blob-identical 27/27"**. There are **25**
+`.py` files — its own arithmetic in the same message says so (`14 app + 10 tests + 3 top-level`, and one
+of those three, `verify_stage1.py`, is itself `.py`). **27 is the total file count; 25 is the `.py`
+count.** The number was carried from the adjacent field into a field that means something else.
+
+```
+405 for 404   right number, wrong instrument   Measure-Object counts lines, not items
+27 for 25     right instrument, wrong number   total file count read into the .py field
+```
+Both produced a confident, specific, wrong count, and **neither would have been caught by re-running
+the same command** — the value came from somewhere else. So:
+
+> **Rule: a number appearing in a neighbouring field will be copied into the wrong field unless it is
+> counted again *in the field it will live in*. Re-derive per field; never carry a total into a
+> subtotal.**
 A line count and a test count differ by a trailing blank, and the difference is silent. This is the
 third off-by-one-or-empty output shape in this session, and the rule for all three is the same:
 **a derived number must be read from the thing that emits it, never recomputed from a proxy.**
