@@ -336,3 +336,77 @@ NOTE - a staged rename of verdict-48684e8.txt -> withdrawn-verdict-48684e8.txt
 appeared in the index that I did not make. I did not commit it and did not
 revert over it. It is preserved in stash@{0} and untouched. That file's
 disposition is not mine.
+
+================================================================================
+d793922: imported amounts now validated with the write path's Amount type
+================================================================================
+
+Closes Core's item 2. /_test/import is unauthenticated, so every field it
+accepted unchecked was reachable by anyone who could reach the port.
+
+The two consequences Core measured on 980c679f1f76, reproduced verbatim against
+this build:
+
+  amount=-500   import -> 422  request amount on exported request 'r_x' must be
+                              greater than zero, got -500
+                pay    -> 404  no such request: 'r_x'
+                u1 balance now 10000   (unchanged; the backward transfer is
+                                        unreachable, not merely refused)
+
+  amount='500'  import -> 422  must be an integer number of minor units, not a
+                              string
+                pay    -> 404  no such request: 'r_x'
+                u1 balance now 10000
+
+The rule is schemas.Amount itself - strict int, gt=0, le=MAX_AMOUNT - via
+store.validate_imported_amount. No looser import-specific variant: an import must
+be at least as strict as the API it feeds.
+
+Audited and now checked on the import path:
+  requests.amount        -5, 0, '500', 1.5, True, 2**53, None  -> 422
+  authorizations.amount  negative refused; it used to import 200 and contribute
+                         nothing to held, leaving an open record reserving
+                         nothing
+  activity.amount        validated when present, left alone when absent
+  balances               negative already rejected; regression test added so the
+                         new checks cannot have loosened it
+
+xfail(strict) marker removed - the gap it named is closed.
+
+Red proof, stash-store.py-only method (my tests against the w6c-era store.py,
+which has no validate_imported_amount):
+
+  test_an_imported_request_amount_is_validated_like_the_write_path    FAILED
+  test_an_imported_negative_request_amount_cannot_be_paid_backwards  FAILED
+  test_an_imported_negative_authorization_amount_is_refused          FAILED
+  test_an_imported_activity_amount_is_validated                      FAILED
+  test_a_rejected_amount_import_changes_nothing                      FAILED
+  test_activity_entries_without_an_amount_still_import               PASSED
+  test_negative_balances_are_still_rejected_and_this_did_not_loosen_them PASSED
+
+5 red -> green. The 2 that passed red are the guards, and passing red is correct:
+they assert behaviour that was already right and must stay right.
+
+  host suite        383 passed (was 376 passed, 1 xfailed)
+  in-image suite    383 passed
+  Stage-1 harness   174 passed, 0 failed
+  image             sha256:ab15423c57e7f0ac30299f9ec5b2fe894700a9776aca749cef479ee4bfb31556
+
+Also added section-map-E-and-I.md: §E and §I committed as explicit test-name maps
+per Core's item 4, so the gate verifies against named tests rather than English.
+
+Correction to my own §F report: I could not reproduce a silent replay. All five
+write paths already fingerprint raw body bytes - operations.py:86,161,224,513,663
+and authorizations.py:344,570 all take RawBody, committed at 0afd2be 'fingerprint
+raw body bytes on all seven write paths'. Measured on w8-final, +extra -> 409 on
+/payments, /requests, /splits, /settlements, /authorizations: SILENT REPLAYS 0.
+
+My first three §F probes reported FAIL on /splits and /settlements. Those were
+my payloads, not the product: 'handles' is not a field on SplitIn, and
+SettlementEntry wants from/to, plus settlements is operator-only. Once I used the
+RICH_FIXTURE and an operator token, all five pass. Same class of error as the
+stale-uvicorn trap - a probe failing for its own reasons.
+
+NOTE: a staged rename verdict-48684e8.txt -> withdrawn-verdict-48684e8.txt that I
+did not make is still preserved in stash@{0}, untouched and uncommitted. Its
+disposition is not mine.
