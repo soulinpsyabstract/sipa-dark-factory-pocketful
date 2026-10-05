@@ -306,6 +306,80 @@ def test_split_pages_pull_nothing_over_the_network():
             assert bad not in page, f"{path} references {bad}"
 
 
+XSS = '<script>alert("xss")</script>'
+
+
+@pytest.mark.parametrize("path", ["/", "/requests", "/authorizations"])
+def test_attacker_controlled_display_name_is_escaped_everywhere_it_lands(path):
+    """A display name is a free-text, attacker-supplied string that lands in HTML.
+
+    This is the most likely place a UI branch introduces a real vulnerability, so
+    it is tested with a real payload rather than a bare ``<script>``.
+
+    The handle charset is ``^[a-z0-9_]{1,20}$``, so a handle cannot carry a tag -
+    the display name, note and memo are the reachable surface.
+    """
+    client.post(
+        "/_test/reset",
+        json={
+            "seeded_total": 2000,
+            "users": [
+                {"handle": "ada", "email": "ada@example.com", "balance": 2000,
+                 "password": "pw12345", "display_name": XSS},
+                {"handle": "bob", "email": "bob@example.com", "balance": 0,
+                 "password": "pw12345", "display_name": XSS},
+            ],
+        },
+    )
+    _login()
+
+    page = _get(path)
+    assert XSS not in page, "a raw script tag reached the HTML"
+    assert "<script" not in page, "a script tag reached the HTML"
+    assert "&lt;script&gt;" in page, "the payload should appear escaped, not dropped"
+
+
+def test_attacker_controlled_payment_note_is_escaped():
+    """A payment note is the other free-text field that reaches every page."""
+    _seed()
+    _login()
+    # The API branch needs a bearer token; the cookie session only drives HTML.
+    token = client.post(
+        "/auth/login", json={"email": "ada@example.com", "password": "pw12345"}
+    ).json()["access_token"]
+    r = client.post(
+        "/payments",
+        json={"to": "bob", "amount": 100, "note": XSS},
+        headers={"Authorization": f"Bearer {token}", "Idempotency-Key": "xss1"},
+    )
+    assert r.status_code in (200, 201), r.text
+
+    for path in ("/", "/requests", "/authorizations"):
+        page = _get(path)
+        assert "<script" not in page, f"{path} rendered a script tag from a note"
+        assert XSS not in page, f"{path} rendered a raw payload from a note"
+
+
+def test_the_page_carries_no_link_tag_that_could_fetch():
+    """``<link href=...>`` is an asset fetch, whatever the scheme.
+
+    ``<link rel="icon" href="data:,">`` is deliberately present: it is a data URI
+    that stops the browser requesting ``/favicon.ico``, so it fetches nothing
+    off-box. The guard is that no link href may point anywhere external.
+    """
+    _seed()
+    _login()
+    import re as _re
+
+    for path in ("/", "/requests", "/authorizations", "/split", "/login", "/signup"):
+        page = _get(path)
+        for tag in _re.findall(r"<link[^>]*>", page, _re.I):
+            href = _re.search(r'href=[\"\']([^\"\']*)[\"\']', tag, _re.I)
+            assert href is None or href.group(1).startswith("data:"), (
+                f"{path} has a <link> that could fetch: {tag}"
+            )
+
+
 def test_the_session_token_never_appears_on_the_new_pages():
     _seed()
     _login()
