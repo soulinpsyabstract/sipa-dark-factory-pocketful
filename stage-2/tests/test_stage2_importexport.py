@@ -127,29 +127,85 @@ def test_every_session_survives_not_just_one(client):
     assert client.get("/me", headers=auth(bob)).status_code == 200
 
 
-def test_a_tokens_key_in_the_payload_is_ignored_not_honoured(client):
-    """A legacy export carrying `tokens` must not be able to mint a session.
+def test_a_legacy_payload_carrying_tokens_is_honoured(client):
+    """A stage-2 export written before the key was removed must still import.
 
-    Stage-2 exports no longer contain tokens, but an export taken by an earlier
-    stage-2 build does. Importing one must not restore a session from it: a
-    payload-supplied token is an assertion about authentication, and honouring it
-    would let any holder of an old export file authenticate as any handle they
-    name. Sessions come from the server's own table only.
+    Such a payload carries its own ``tokens`` list. Honouring it is what keeps an
+    already-generated file usable; the current export never produces one.
+
+    The residual property, stated plainly rather than glossed: a payload token
+    *does* authenticate. That is the accepted cost of importing files that were
+    written when exporting tokens was the specified behaviour.
     """
     ada = login(client, "ada")
+    legacy = {"token": "legacy-ada-token", "handle": "ada"}
+
     payload = export(client)
-    payload["tokens"] = [
-        {"token": "forged-token", "handle": "ada"},
-        {"token": "ghost-token", "handle": "nobody"},
-    ]
+    assert "tokens" not in payload, "the current export must not carry tokens"
+    payload["tokens"] = [legacy]
+
+    assert do_import(client, payload).status_code == 200
+    r = client.get("/me", headers=auth("legacy-ada-token"))
+    assert r.status_code == 200, r.text
+    assert r.json()["handle"] == "ada"
+
+    # The payload's list is authoritative rather than merged, so a token that was
+    # live but absent from the legacy snapshot stops working. That is the point of
+    # a snapshot: it records who was signed in when it was taken. The no-key path
+    # is the one that preserves, and that is the path the current export takes.
+    assert client.get("/me", headers=auth(ada)).status_code == 401, (
+        "a legacy payload's token list should replace, not merge with, live sessions"
+    )
+
+
+def test_a_legacy_token_cannot_resurrect_a_deprovisioned_user(client):
+    """The compat path must not become the bypass the security leg rules out.
+
+    A legacy payload that both removes a handle *and* still carries that handle's
+    token is dropped, not honoured and not refused. Dropping rather than 422 is
+    deliberate: a 422 would make the legacy file unimportable in precisely the
+    case where it deprovisions someone.
+    """
+    ada = login(client, "ada")
+    login(client, "bob")
+
+    payload = export(client)
+    payload["tokens"] = [{"token": "legacy-ada-token", "handle": "ada"}]
+    payload["users"] = [u for u in payload["users"] if u.get("handle") != "ada"]
+    payload["balances"] = {"bob": 0}
+    payload["seeded_total"] = 0
+    payload["authorizations"] = []
+
     assert do_import(client, payload).status_code == 200
 
-    forged = client.get("/me", headers=auth("forged-token"))
-    assert forged.status_code == 401, "a token from the payload was honoured"
-    ghost = client.get("/me", headers=auth("ghost-token"))
-    assert ghost.status_code == 401, "a payload token for an absent user was honoured"
-    # And the genuinely live session still works.
-    assert client.get("/me", headers=auth(ada)).status_code == 200
+    assert client.get("/me", headers=auth("legacy-ada-token")).status_code == 401, (
+        "a legacy payload token resurrected a deprovisioned user - auth bypass"
+    )
+    assert client.get("/me", headers=auth(ada)).status_code == 401
+
+
+def test_a_malformed_tokens_key_is_refused(client):
+    """A structurally broken compat payload is still a 422, not a silent wipe."""
+    payload = export(client)
+    payload["tokens"] = 7
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "validation_error", r.text
+
+    payload = export(client)
+    payload["tokens"] = ["not-an-object"]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+
+    payload = export(client)
+    payload["tokens"] = [{"handle": "ada"}]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+
+    payload = export(client)
+    payload["tokens"] = [{"token": "t_x"}]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
 
 
 # ----------------------------------------------------------------------

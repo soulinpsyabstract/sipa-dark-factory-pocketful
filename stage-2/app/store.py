@@ -968,7 +968,7 @@ class Store:
             restored_auth[auth_id] = record
         self.authorizations = restored_auth
 
-        # Sessions are preserved server-side, never through the payload.
+        # Sessions are preserved server-side, never *required* to travel.
         #
         # The export carries no `tokens`, so there is nothing to restore and
         # nothing to validate: the live table is simply kept for the handles this
@@ -983,15 +983,38 @@ class Store:
         # export/import upgrade must remain signed in afterwards" describes an
         # in-place upgrade on the same server, and this is the same server, so
         # its own sessions are still valid afterwards.
-        #
-        # A `tokens` key in the payload is ignored rather than honoured, so a
-        # legacy stage-2 export cannot smuggle a session onto a handle the
-        # import did not preserve, and cannot resurrect a deprovisioned user.
-        self.tokens = {
-            token: handle
-            for token, handle in (live_tokens or {}).items()
-            if handle in self.users
-        }
+        raw_tokens = payload.get("tokens")
+        if raw_tokens is None:
+            self.tokens = {
+                token: handle
+                for token, handle in (live_tokens or {}).items()
+                if handle in self.users
+            }
+        else:
+            # A legacy stage-2 payload, written by a build from before the
+            # export stopped carrying tokens. Honour it so an
+            # already-generated file still imports.
+            #
+            # The one thing that is *not* honoured is a token naming a handle
+            # this import removes: honouring it would leave a deprovisioned user
+            # authenticated. Such tokens are dropped rather than refused, so a
+            # legacy file still imports in exactly the case where it removes
+            # someone, instead of failing closed on a 422.
+            if not isinstance(raw_tokens, list):
+                raise validation_error("export 'tokens' must be a list")
+            restored: dict[str, str] = {}
+            for record in raw_tokens:
+                if not isinstance(record, dict):
+                    raise validation_error("each exported token must be an object")
+                token, handle = record.get("token"), record.get("handle")
+                if not isinstance(token, str) or not token:
+                    raise validation_error("each exported token needs a 'token'")
+                if not isinstance(handle, str) or not handle:
+                    raise validation_error("each exported token needs a 'handle'")
+                if handle not in self.users:
+                    continue
+                restored[token] = handle
+            self.tokens = restored
 
         # A restored snapshot must still satisfy every invariant.
         self._check_invariants()
