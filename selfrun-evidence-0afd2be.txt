@@ -1,0 +1,92 @@
+Stage 2 W7 self-run evidence — builder seat (sipaosdarkv4)
+
+STATUS: SELF-RUN GREEN, UNGATED.
+Builder evidence only. Not a verdict. No Stage-2 wave carries an independent
+behavioural verdict; the W6-tip gate is being performed by Core as
+planner-verified by operator authorization.
+
+Section closed : F (D6 idempotency)
+Commit         : 0afd2be  "Stage 2 W7: fingerprint raw body bytes on all seven write paths"
+Artifact tag   : pocketful-stage2:w7
+Image ID       : sha256:15b06fff3b7c67f12b3375f5ff0934998fa3157996dbb62f696d02c7a858d046
+Image created  : 2026-10-05T01:19:05.782683738Z
+Build          : clean export of 0afd2be via zip + Expand-Archive, no pipe
+BLOB_HASH      : 27 compared, 0 mismatches (git tree vs extracted, app + tests)
+
+Measured results
+  host stage-2 suite        : 273 passed, 1 xfailed in 185.89s
+  in-image --network none   : 273 passed, 1 xfailed in 146.34s
+  stage-1 harness vs image  : 174 passed, 0 failed
+  D3 smoke vs image         : 46/46 ALL PASS
+  D1 offline                : DNS gaierror, TCP OSError (confirmed blocked)
+  ID before gates == ID after gates == 15b06fff3b7c
+
+The defect this wave closed (sec F)
+  Five of the seven write paths fingerprinted body.model_dump(mode="json")
+  instead of the request. Every request schema is extra="ignore", so
+  unrecognised fields were dropped before hashing and two different bodies
+  could collide into one fingerprint, producing a silent replay where the
+  spec owes a divergence error. Same defect class as the W5 import
+  double-spend: fingerprinting a normalised projection rather than the
+  request itself.
+
+  Money was never at risk. A replay returns the original response and moves
+  nothing, so the observable damage was a masked client bug, not a double
+  spend. Recorded plainly rather than overstated.
+
+  Proven on 980c679f1f76 BEFORE the fix, same key, four bodies:
+    {to,amount:10}         -> 200 pay_1
+    + extra:'surprise'     -> 200 pay_1     <-- different body, silent replay
+    + note:'different'     -> 409 idempotency_key_reuse
+    amount:999             -> 409 idempotency_key_reuse
+    ada 2000 -> 1990, bob 0 -> 10         (money moved exactly once)
+
+  Same probe on 15b06fff3b7c AFTER the fix:
+    {to,amount:10}         -> 200
+    identical replay       -> 200 (replays, unchanged response)
+    + extra:'surprise'     -> 409           <-- fixed
+    amount:999             -> 409
+    ada balance 1990                        (money still moved once)
+
+Teeth check — 12 new tests in tests/test_stage2_idempotency_bytes.py.
+Five fail against the pre-W7 operations.py, and they are exactly the five
+paths that hashed the model:
+  test_payments_divergence_is_seen_when_only_an_unknown_field_changes
+  test_requests_divergence_is_seen_when_only_an_unknown_field_changes
+  test_pay_request_divergence_is_seen_when_a_body_is_supplied_at_all
+  test_splits_divergence_is_seen_when_only_an_unknown_field_changes
+  test_settlements_divergence_is_seen_when_only_an_unknown_field_changes
+
+Stronger guarantees found and pinned while writing them
+  - capture refuses unknown fields outright, 422 validation_failed, before
+    idempotency is consulted; it does not merely fingerprint them differently
+  - an absent or blank body normalises to b"{}", so genuine no-body retries
+    still replay; but on a body-required path a whitespace body fails JSON
+    decoding and is refused 422 rather than read as absent
+  - an identical replay still returns the original status and body
+  - keys remain scoped per user across paths
+
+Contract items still open, unchanged, neither blocking A-I
+  1. Imported pending request `amount` is unvalidated (type, sign, presence)
+     while `status` and both handles are. xfail(strict) so it fails loudly
+     when fixed.
+  2. Asymmetry awaiting Core's ruling: a stage-1 snapshot has no
+     `authorizations` key, so importing one releases an existing hold
+     (held 500 -> 0) while the session survives. Believed correct - sessions
+     are server-side and SPEC 151 singles them out; a hold absent from the
+     payload cannot be restored and should not be invented - but not addressed
+     by the amended D3 clause.
+  3. Core's sec E bullet says double void returns `already_voided`; SPEC.md
+     line 328 says 200 with the current state, which is what ships. Flagged,
+     not changed.
+
+Artifact history (nothing pruned, no tag re-pointed)
+  w4           741ae47f6f2e  f89e0a4   superseded, verdict WITHDRAWN by Core
+  w4-verify    ad54b473f333            superseded
+  w5           4eeb3e45fc85  6226ed1   VULNERABLE, must never ship
+  w6           01bf6c15cc94  ca71a9d   superseded
+  w6b          b693eed4a6ef  6f07f4e   superseded
+  w6c          980c679f1f76  1601616   amended D3, superseded by W7
+  w7           15b06fff3b7c  0afd2be   CURRENT
+  latest       15b06fff3b7c            cosmetic only, permanently banned as a
+                                       gate target
