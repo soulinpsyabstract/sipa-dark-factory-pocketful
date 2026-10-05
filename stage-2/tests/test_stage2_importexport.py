@@ -127,132 +127,114 @@ def test_every_session_survives_not_just_one(client):
     assert client.get("/me", headers=auth(bob)).status_code == 200
 
 
-def test_a_legacy_payload_carrying_tokens_is_honoured(client):
-    """A stage-2 export written before the key was removed must still import.
+def test_a_payload_tokens_key_is_ignored_entirely(client):
+    """An incoming ``tokens`` key neither authenticates nor de-authenticates.
 
-    Such a payload carries its own ``tokens`` list. Honouring it is what keeps an
-    already-generated file usable; the current export never produces one.
-
-    The residual property, stated plainly rather than glossed: a payload token
-    *does* authenticate. That is the accepted cost of importing files that were
-    written when exporting tokens was the specified behaviour.
+    Exports written before the key was dropped still have to import, so the key
+    is accepted and discarded. It is not honoured (that would be an
+    unauthenticated write into the session table) and it is not validated (that
+    would make an old file unimportable over a field nobody reads any more).
     """
-    ada = login(client, "ada")
-    legacy = {"token": "legacy-ada-token", "handle": "ada"}
-
+    ada = auth(login(client, "ada"))
     payload = export(client)
     assert "tokens" not in payload, "the current export must not carry tokens"
-    payload["tokens"] = [legacy]
 
+    payload["tokens"] = [{"token": "attacker-chosen", "handle": "ada"}]
     assert do_import(client, payload).status_code == 200
-    r = client.get("/me", headers=auth("legacy-ada-token"))
-    assert r.status_code == 200, r.text
-    assert r.json()["handle"] == "ada"
 
-    # The payload's list is authoritative rather than merged, so a token that was
-    # live but absent from the legacy snapshot stops working. That is the point of
-    # a snapshot: it records who was signed in when it was taken. The no-key path
-    # is the one that preserves, and that is the path the current export takes.
-    assert client.get("/me", headers=auth(ada)).status_code == 401, (
-        "a legacy payload's token list should replace, not merge with, live sessions"
-    )
+    # It does not authenticate: the chosen string is not a session.
+    assert client.get("/me", headers=auth("attacker-chosen")).status_code == 401
+    # And it does not de-authenticate: the live session is untouched.
+    assert client.get("/me", headers=ada).status_code == 200
 
 
-def test_a_legacy_token_cannot_resurrect_a_deprovisioned_user(client):
-    """The compat path must not become the bypass the security leg rules out.
+def test_a_payload_tokens_key_cannot_mint_a_session_for_another_user(client):
+    """The regression that made the key dangerous. Measured on 066bb0a:
 
-    A legacy payload that both removes a handle *and* still carries that handle's
-    token is dropped, not honoured and not refused. Dropping rather than 422 is
-    deliberate: a 422 would make the legacy file unimportable in precisely the
-    case where it deprovisions someone.
+    a caller imported a payload carrying {"token": <their own string>, "handle":
+    "ada"}, then authenticated as ada and moved 4000 minor units out of her
+    wallet. ``/_test/import`` requires no authentication, so this was reachable
+    by anyone who could reach the port at all.
     """
-    ada = login(client, "ada")
+    login(client, "ada")
+    ada = auth(login(client, "ada"))
+
+    payload = export(client)
+    payload["tokens"] = [{"token": "attacker-minted-this", "handle": "ada"}]
+    assert do_import(client, payload).status_code == 200
+
+    forged = auth("attacker-minted-this")
+    assert client.get("/me", headers=forged).status_code == 401, (
+        "a payload tokens key minted a working session"
+    )
+    pay = client.post(
+        "/payments",
+        headers={**forged, "Idempotency-Key": "esc"},
+        json={"to": "bob", "amount": 4000},
+    )
+    assert pay.status_code == 401, f"forged token moved money: {pay.text}"
+    assert client.get("/me", headers=ada).status_code == 200
+
+
+def test_an_old_export_carrying_tokens_cannot_wipe_sessions(client):
+    """The upgrade path: a pre-G file imports and leaves everyone signed in.
+
+    This is the property that makes ignoring the key safe - the live table is
+    preserved for surviving handles regardless of what the payload claims.
+    """
+    ada = auth(login(client, "ada"))
+    bob = auth(login(client, "bob"))
+
+    payload = export(client)
+    payload["tokens"] = [
+        {"token": "stale-ada", "handle": "ada"},
+        {"token": "stale-bob", "handle": "bob"},
+    ]
+    assert do_import(client, payload).status_code == 200
+
+    assert client.get("/me", headers=ada).status_code == 200
+    assert client.get("/me", headers=bob).status_code == 200
+    for stale in ("stale-ada", "stale-bob"):
+        assert client.get("/me", headers=auth(stale)).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "junk", [7, "not-a-list", ["not-an-object"], [{"handle": "ada"}], [{"token": "t"}]]
+)
+def test_a_structurally_broken_tokens_key_is_ignored_not_refused(client, junk):
+    """A broken key is discarded like any other.
+
+    Refusing it would 422 the whole import over a field with no effect, which
+    would make every pre-G export unimportable for no benefit.
+    """
+    ada = auth(login(client, "ada"))
+    payload = export(client)
+    payload["tokens"] = junk
+    r = do_import(client, payload)
+    assert r.status_code == 200, r.text
+    assert client.get("/me", headers=ada).status_code == 200
+
+
+def test_a_deprovisioning_import_still_signs_the_removed_user_out(client):
+    """Dropping tokens must not weaken the leg that matters.
+
+    Removing a handle scopes preservation to surviving handles, so the removed
+    user's live session dies even though the payload carries a token for them.
+    """
+    ada = auth(login(client, "ada"))
     login(client, "bob")
 
     payload = export(client)
-    payload["tokens"] = [{"token": "legacy-ada-token", "handle": "ada"}]
+    payload["tokens"] = [{"token": "legacy-ada", "handle": "ada"}]
     payload["users"] = [u for u in payload["users"] if u.get("handle") != "ada"]
     payload["balances"] = {"bob": 0}
     payload["seeded_total"] = 0
     payload["authorizations"] = []
 
     assert do_import(client, payload).status_code == 200
-
-    assert client.get("/me", headers=auth("legacy-ada-token")).status_code == 401, (
-        "a legacy payload token resurrected a deprovisioned user - auth bypass"
-    )
-    assert client.get("/me", headers=auth(ada)).status_code == 401
-
-
-def test_a_malformed_tokens_key_is_refused(client):
-    """A structurally broken compat payload is still a 422, not a silent wipe."""
-    payload = export(client)
-    payload["tokens"] = 7
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-    assert r.json()["code"] == "validation_error", r.text
-
-    payload = export(client)
-    payload["tokens"] = ["not-an-object"]
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-
-    payload = export(client)
-    payload["tokens"] = [{"handle": "ada"}]
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-
-    payload = export(client)
-    payload["tokens"] = [{"token": "t_x"}]
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-
-
-def test_a_legacy_token_naming_a_handle_that_never_existed_is_refused(client):
-    """A token for a handle the snapshot never had is a malformed payload.
-
-    Distinct from the deprovisioning case above, which must still import: there
-    the handle used to exist here and this import removes it, so dropping the
-    token is right. Here no reading of the payload is coherent.
-    """
-    payload = export(client)
-    payload["tokens"] = [{"token": "t_ghost", "handle": "nobody"}]
-    r = do_import(client, payload)
-    assert r.status_code == 422, r.text
-    assert r.json()["code"] == "unknown_user", r.text
-
-
-def test_the_ghost_token_is_refused_but_a_deprovisioning_import_still_lands(client):
-    """The two legs together, because they collide on nearly the same input.
-
-    Both payloads keep the export's ``requests`` / ``activity`` / ``idempotency``
-    keys: a payload without them is a bare fixture and takes a different branch,
-    so it would never reach the tokens handling at all and would make this test
-    pass for the wrong reason.
-    """
-    ada = auth(login(client, "ada"))
-    full = export(client)
-
-    deprovisioning = dict(full)
-    deprovisioning["users"] = []
-    deprovisioning["balances"] = {}
-    deprovisioning["balance_sum"] = 0
-    deprovisioning["seeded_total"] = 0
-    deprovisioning["activity"] = []
-    deprovisioning["requests"] = []
-    deprovisioning["idempotency"] = []
-    deprovisioning["tokens"] = [{"token": "t_ada", "handle": "ada"}]
-
-    r = do_import(client, deprovisioning)
-    assert r.status_code == 200, f"deprovisioning import must land, got {r.text}"
     assert client.get("/me", headers=ada).status_code == 401, (
         "a deprovisioning import left the removed user authenticated"
     )
-
-    ghost = dict(deprovisioning)
-    ghost["tokens"] = [{"token": "t_ghost", "handle": "nobody"}]
-    r2 = do_import(client, ghost)
-    assert r2.status_code == 422, r2.text
 
 
 # ----------------------------------------------------------------------

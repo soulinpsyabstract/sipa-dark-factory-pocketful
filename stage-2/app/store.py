@@ -862,7 +862,6 @@ class Store:
         captured by ``_import``. ``_install_fixture`` clears it, so it has to be
         handed in rather than read back off ``self``.
         """
-        prior_handles = frozenset(self.users)
         self._install_fixture(
             {
                 "users": payload.get("users", []),
@@ -990,49 +989,22 @@ class Store:
         # export/import upgrade must remain signed in afterwards" describes an
         # in-place upgrade on the same server, and this is the same server, so
         # its own sessions are still valid afterwards.
-        raw_tokens = payload.get("tokens")
-        if raw_tokens is None:
-            self.tokens = {
-                token: handle
-                for token, handle in (live_tokens or {}).items()
-                if handle in self.users
-            }
-        else:
-            # A legacy stage-2 payload, written by a build from before the
-            # export stopped carrying tokens. Honour it so an
-            # already-generated file still imports.
-            #
-            # Two different bad things can show up here, and they need
-            # different answers:
-            #
-            # * A token naming a handle *this import removes*. Honouring it
-            #   would leave a deprovisioned user authenticated, so it is
-            #   dropped. It is dropped rather than refused because refusing
-            #   would 422 the whole import, and the point of a deprovisioning
-            #   import is that it succeeds.
-            # * A token naming a handle that never existed here at all. No
-            #   reading of that payload is coherent, so it is a malformed
-            #   payload and is refused outright.
-            if not isinstance(raw_tokens, list):
-                raise validation_error("export 'tokens' must be a list")
-            restored: dict[str, str] = {}
-            for record in raw_tokens:
-                if not isinstance(record, dict):
-                    raise validation_error("each exported token must be an object")
-                token, handle = record.get("token"), record.get("handle")
-                if not isinstance(token, str) or not token:
-                    raise validation_error("each exported token needs a 'token'")
-                if not isinstance(handle, str) or not handle:
-                    raise validation_error("each exported token needs a 'handle'")
-                if handle not in self.users:
-                    if handle in prior_handles:
-                        continue
-                    raise validation_error(
-                        f"exported token references unknown user {handle!r}",
-                        code="unknown_user",
-                    )
-                restored[token] = handle
-            self.tokens = restored
+        #
+        # An incoming ``tokens`` key is IGNORED, deliberately and for backward
+        # compatibility with exports written before the key was dropped, so an
+        # old file still imports. Do not "fix" this by reading, validating or
+        # honouring that key: it is a write into the session table from an
+        # endpoint (``/_test/import``) that requires no authentication at all.
+        # Any caller could import a payload carrying
+        # ``{"token": <their own string>, "handle": <someone else>}`` and then
+        # authenticate as that someone -- measured on 066bb0a, a caller did
+        # exactly that and moved 4000 minor units out of ada's wallet. Sessions
+        # have exactly one source, the live table.
+        self.tokens = {
+            token: handle
+            for token, handle in (live_tokens or {}).items()
+            if handle in self.users
+        }
 
         # A restored snapshot must still satisfy every invariant.
         self._check_invariants()
