@@ -488,5 +488,21 @@ found the live path — you have found a line that reads like one.
 ## Counting convention
 
 **Count collected node IDs, not `def` lines.** `@pytest.mark.parametrize` expands one definition into
-several tests, so `^def test_` undercounts. `pytest --collect-only -q | Measure-Object -Line` is the
-instrument. A `grep` for `def test_` is a way of finding *names*, never of counting *tests*.
+several tests, so `^def test_` undercounts. A `grep` for `def test_` is a way of finding *names*,
+never of counting *tests*.
+
+**Corrected: `Measure-Object -Line` on `--collect-only -q` is NOT the instrument. It is off by one.**
+
+```
+<404 node ID lines>
+<blank>
+404 tests collected in 2.83s        <- THIS is the count
+```
+`pytest --collect-only -q | Measure-Object -Line` returns **405** for **404** tests. The earlier
+version of this convention named that pipeline as authoritative and was wrong; it was adopted without
+a positive control, which is the absence-instrument hazard applied to arithmetic.
+
+**The instrument is the `N tests collected` summary line. Read it, do not infer it from a line count.**
+A line count and a test count differ by a trailing blank, and the difference is silent. This is the
+third off-by-one-or-empty output shape in this session, and the rule for all three is the same:
+**a derived number must be read from the thing that emits it, never recomputed from a proxy.**
