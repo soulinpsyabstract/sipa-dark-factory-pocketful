@@ -175,3 +175,100 @@ the spec's table are served. f4eb1d9, f9826c5, 1ed0336, 7a7642a, 066bb0a,
 Correction to item 6: the W4 verdict rename is committed at 6a9ed09.
 withdrawn-verdict-f89e0a4.txt is tracked, line 1 is the WITHDRAWN - NOT A GATE
 banner, and verdict-f89e0a4.txt does not exist on disk.
+================================================================================
+W8 HOLDS: an unauthenticated import must not release committed funds
+commit cb18e6e  (built on 80490de)
+================================================================================
+
+The defect, and it was not confined to W5.
+
+  ada authorizes bob for 800  ->  held 800, available 1200
+  POST /_test/import with NO AUTHENTICATION HEADERS, stage-1-shaped payload
+  (no `authorizations` key)                      ->  200
+  after                                            ->  held 0, available 2000
+  bob's subsequent capture                         ->  404 no such authorization
+
+/_test/import requires no authentication (system.py has no Depends on that
+route), so anyone who could reach the port handed reserved funds back to the
+payer while the recipient lost the right to capture them. That is the ground on
+which W5 is disqualified, and it was live at HEAD, not only in 4eeb3e45fc85.
+
+Measured raw on three images already on disk, same probe, same payload:
+
+  pocketful-stage2:w5        4eeb3e45fc85   HOLD RELEASED: True   capture 404
+  pocketful-stage2:w8-final  0d73fd88d324   HOLD RELEASED: True   capture 404
+  pocketful-stage2:w7-token  829b18071681   HOLD RELEASED: True   capture 404
+
+w7-token is the tag behind `latest`. So the finding covers W5, W8 and the
+current latest, not just the disqualified W5.
+
+I had filed this as a 'known non-W8 contract gap'. That framing was wrong and I
+am retracting it.
+
+Root cause
+----------
+`payload.get('authorizations') or []` collapsed 'key absent' into 'empty'. The
+comment directly above that line already stated the hazard correctly - 'an
+exported authorization that was dropped here would silently un-reserve its
+money and let the payer spend the same funds twice' - and I had guarded only
+the round-trip case where the payload carries authorizations. A stage-1 export
+has no such key, because stage 1 has no such concept, so it was read as an
+instruction to release everything.
+
+Fix
+---
+  'authorizations' absent  ->  preserve live holds for surviving handles
+  'authorizations' present ->  restore verbatim, unchanged
+
+Both import paths could do it, so both are fixed. _install_fixture takes an
+explicit preserve_live_holds flag rather than changing its default, because
+/_test/reset is the one place where wiping state is the point and it must keep
+wiping. Both import call sites opt in; the reset route does not.
+
+A hold whose payer or recipient the import removes still drops with them. An
+exported authorization naming a removed payer is a 422 unknown_user, not a
+silent drop.
+
+Tests
+-----
+Two tests pinned the vulnerable behaviour and are inverted rather than worked
+around, the same treatment explicit-empty-is-authoritative received:
+
+  test_a_bare_fixture_import_still_clears_stage2_state
+    previously asserted held 500 -> 0 on a bare fixture import. It now asserts
+    the hold survives, and still asserts the feed, idempotency records and
+    sessions are cleared.
+  new  test_a_bare_fixture_import_must_not_release_a_live_hold
+  new  test_a_stage1_shaped_import_must_not_release_a_live_hold
+       also captures afterwards, so the authorization is proven still real and
+       not merely still counted
+  new  test_a_fixture_that_does_deprovision_the_payer_drops_their_hold
+
+Results on cb18e6e
+------------------
+  hold probe, in-image      HOLD RELEASED: False, capture 201 pay_1 for 800
+  in-image suite            379 passed, 1 xfailed
+  host suite                379 passed, 1 xfailed
+  Stage-1 harness           174 passed, 0 failed
+  G1 export omits tokens              PASS  keys=14
+  G1b no 'tokens' substring           PASS
+  G2 stage-1-shaped keeps session     PASS  import=200 me=200
+  G3 deprovisioning drops session     PASS  import=200 me=401
+  G4 empty tokens key is harmless     PASS  import=200 me=200
+  G5 incoming token cannot auth       PASS  import=200 me=401 pay=401
+  JSON byte identity           36/36 vs f9826c5 (hashed diff, both trees run)
+  offline --network none      six routes 200, no external references
+  image id                    sha256:c3f58642d7c3ff4a65e3dc17ca9ff820164f7762e2ff07dfa0e6e6cdfcb30198
+  tag                         pocketful-stage2:w8-holds
+
+Methodology note, because it nearly produced a false result in both directions
+--------------------------------------------------------------------------
+An early post-fix probe still reported HOLD RELEASED: True against freshly
+edited source. The cause was a stale uvicorn from an earlier session still
+holding 127.0.0.1:8080 (winerror 10048); the new server never bound, so the
+probe was measuring pre-fix code. json_snapshot.py has the same shape of trap:
+it only prints hashes, and identity is a diff between two trees. The 36/36 above
+is a real Compare-Object diff of both trees' output, not a single run.
+
+latest is untouched at sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741.
+No gate target has been named.
