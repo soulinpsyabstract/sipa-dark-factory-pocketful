@@ -112,3 +112,66 @@ removes is dropped, a handle never present is a 422. Both branches are pinned in
 one test, because a payload without requests/activity/idempotency is a bare
 fixture that never reaches the tokens handling and would pass for the wrong
 reason - which is exactly what my first version of that test did.
+
+Addendum - 42edbf7
+------------------
+SECURITY. The compat branch added at 05f7d8d, which honoured a legacy
+payload's tokens list, was an account-takeover path. Measured on 066bb0a:
+
+  caller imports payload tokens: [{token: <caller-chosen>, handle: "ada"}]
+  chosen token GET /me      -> 200 ada
+  chosen token POST /payments {to: bob, amount: 4000} -> 200
+
+and /_test/import requires no authentication, so anyone who could reach the
+port could take over any account and empty its wallet. Core argued for ignoring
+the key on correctness grounds; it was worse than correctness.
+
+42edbf7 deletes the branch. An incoming tokens key is ignored for backward
+compatibility with pre-G exports. Sessions have exactly one source, the live
+table, preserved for surviving handles.
+
+Re-measured in-image on 42edbf7:
+  chosen token GET /me      -> 401
+  chosen token POST /payments -> 401
+
+  G1  export omits bearer tokens .............. PASS  14 keys, no "tokens" substring
+  G2  stage-1-shaped export preserves session .. PASS  import 200, /me 200
+  G3  deprovisioning import drops session ..... PASS  import 200, /me 401
+  G4  explicit EMPTY tokens key does not
+       de-authenticate ........................ PASS  import 200, /me 200
+  G5  incoming token does not authenticate .... PASS  import 200, /me 401 pay 401
+
+G4 and G5 changed meaning. Under the old contract an explicit tokens list was
+authoritative, so G4 asserted 401. That test pinned the vulnerable semantics and
+is deleted rather than worked around. Neither leg may now assert anything about
+a field with no effect: G4 is "the key does not de-authenticate", G5 is "the key
+does not authenticate" - one property from two sides.
+
+Tests follow the contract:
+  - a tokens key neither authenticates nor de-authenticates
+  - the escalation itself is a regression test
+  - a pre-G export carrying tokens cannot wipe sessions (the upgrade path)
+  - a structurally broken tokens key is discarded, not 422, since refusing it
+    would make every pre-G export unimportable over a field with no effect
+  - deprovisioning still signs the removed user out
+store.py carries a docstring saying the key is ignored for backward
+compatibility, with the measurement, so nobody re-adds validation.
+
+Other results on 42edbf7:
+  in-image suite             376 passed, 1 xfailed
+  Stage-1 harness           174 passed, 0 failed
+  JSON byte identity        36/36 vs f9826c5
+  offline --network none    isolation confirmed (outbound socket -> OSError),
+                            six routes 200, no external references
+  image id                  sha256:0d73fd88d32426894bbf52c11a472f44048596a472872ae1ee0fdb62655097c5
+  archive sha256            0f40f956843f5a55d7728c6653b2da658db511f12d318c1e63b68830d2bfb12d
+
+Correction to Core's §H status: it is built, not unstarted. At HEAD,
+git grep -E "text/html|HTMLResponse" -- stage-2/app returns 14 occurrences
+across system.py, operations.py and authorizations.py, and all six routes in
+the spec's table are served. f4eb1d9, f9826c5, 1ed0336, 7a7642a, 066bb0a,
+42edbf7.
+
+Correction to item 6: the W4 verdict rename is committed at 6a9ed09.
+withdrawn-verdict-f89e0a4.txt is tracked, line 1 is the WITHDRAWN - NOT A GATE
+banner, and verdict-f89e0a4.txt does not exist on disk.
