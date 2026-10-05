@@ -17,11 +17,12 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from ..dependencies import get_current_user, store
+from ..dependencies import _user_public, get_current_user, store
 from ..errors import AppError, not_found, validation_error
 from ..schemas import AuthorizationIn
+from ..ui import render_authorizations, wants_html
 from ..store import (
     AUTHORIZATION_STATUSES,
     AUTHORIZATION_VISIBILITIES,
@@ -204,6 +205,7 @@ def resolve_recipient(handle: Any, me: str) -> str:
 
 @router.get("/authorizations")
 def list_authorizations(
+    request: Request,
     me: CurrentUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
@@ -275,7 +277,19 @@ def list_authorizations(
             "status_filter": wanted_status,
         }
 
-    return JSONResponse(status_code=200, content=store.transaction(work))
+    payload = store.transaction(work)
+    if wants_html(request.headers.get("accept")):
+        user = store.read(
+            lambda: _user_public(
+                store.users[me],
+                store.balances,
+                store._funds(me),
+                store.currency,
+                store.minor_units,
+            )
+        )
+        return HTMLResponse(render_authorizations(user=user, items=payload["items"]))
+    return JSONResponse(status_code=200, content=payload)
 
 
 @router.get("/authorizations/{authorization_id}")

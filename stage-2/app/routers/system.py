@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Body
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Body, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from ..dependencies import store
 from ..schemas import FixtureIn
@@ -21,7 +21,49 @@ def health() -> dict[str, str]:
 
 
 @router.get("/")
-def index() -> dict[str, Any]:
+def index(request: Request) -> Any:
+    """JSON service index by default; the wallet screen for ``Accept: text/html``.
+
+    The JSON branch below is byte-for-byte what it has always been. The HTML
+    branch is additive and renders signed-out rather than 401-ing, because a
+    browser following a plain link sends no bearer token and a 401 here would
+    read as a broken negotiation.
+    """
+    from ..ui import render_home, render_signed_out, wants_html
+
+    if wants_html(request.headers.get("accept")):
+        from ..dependencies import _user_public, get_current_user
+        from ..errors import AppError
+
+        handle = None
+        auth = request.headers.get("authorization") or ""
+        token = auth.split(None, 1)[1].strip() if len(auth.split(None, 1)) == 2 else ""
+        if token:
+            try:
+                handle = get_current_user(request, authorization=auth)
+            except AppError:
+                handle = None
+
+        if handle is None:
+            return HTMLResponse(render_signed_out())
+
+        def project() -> tuple[dict, list[dict]]:
+            public = _user_public(
+                store.users[handle],
+                store.balances,
+                store._funds(handle),
+                store.currency,
+                store.minor_units,
+            )
+            rows = [dict(a) for a in store.activity if a["handle"] == handle]
+            rows.sort(key=lambda a: a["id"], reverse=True)
+            return public, rows
+
+        user, rows = store.read(project)
+        return HTMLResponse(
+            render_home(user=user, activity=rows, visibility={})
+        )
+
     return {
         "service": "pocketful-stage-2",
         "status": "ok",

@@ -12,12 +12,13 @@ import json
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from ..dependencies import get_current_user, require_operator, store
+from ..dependencies import _user_public, get_current_user, require_operator, store
 from ..errors import AppError, conflict, forbidden, not_found, validation_error
 from ..schemas import PaymentIn, RequestIn, SettlementIn, SplitIn
 from ..store import MAX_LIST_LIMIT, REQUEST_STATUSES, is_valid_handle, now_iso
+from ..ui import render_requests, wants_html
 
 router = APIRouter()
 
@@ -385,6 +386,7 @@ def cancel_request(request_id: str, me: CurrentUser) -> JSONResponse:
 
 @router.get("/requests")
 def list_requests(
+    request: Request,
     me: CurrentUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
@@ -455,7 +457,19 @@ def list_requests(
             "status_filter": wanted,
         }
 
-    return JSONResponse(status_code=200, content=store.transaction(work))
+    payload = store.transaction(work)
+    if wants_html(request.headers.get("accept")):
+        user = store.read(
+            lambda: _user_public(
+                store.users[me],
+                store.balances,
+                store._funds(me),
+                store.currency,
+                store.minor_units,
+            )
+        )
+        return HTMLResponse(render_requests(user=user, items=payload["items"]))
+    return JSONResponse(status_code=200, content=payload)
 
 
 # ======================================================================
