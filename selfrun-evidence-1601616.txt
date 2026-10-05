@@ -1,0 +1,102 @@
+Stage 2 W6 self-run evidence — builder seat (sipaosdarkv4)
+
+STATUS: SELF-RUN GREEN, UNGATED.
+This file is builder evidence only. It is not a verdict and must never be
+recorded as one. Independent measurement is a separate seat's job; as of this
+commit no Stage-2 wave carries a trustworthy independent behavioural verdict.
+
+Commit        : 1601616  "Stage 2 W6: keep bearer tokens out of the export entirely"
+Artifact tag  : pocketful-stage2:w6c
+Image ID      : sha256:980c679f1f76f2354e0e6805529ffc233843151cc53189d505e8ea06ea6e455e
+Image created : 2026-10-04T23:29:01.640908683Z
+IMAGE_AGE     : +0.0s at build, re-read after all gates, ID unchanged
+
+Build procedure (Core's amended §1, zip not pipe)
+  git archive --format=zip --output=stage2.zip 1601616 stage-2
+  Expand-Archive -LiteralPath stage2.zip -DestinationPath <tmp> -Force
+  docker build -q -t pocketful-stage2:w6c <tmp>\stage-2
+
+BLOB_HASH     : 26 compared, 0 mismatches (git tree 1601616 vs extracted files)
+
+Measured results
+  host stage-2 suite    : 261 passed, 1 xfailed in 177.81s
+  host stage-1 suite    : 60 passed in 32.09s
+  in-image --network none : 261 passed, 1 xfailed in 189.06s (wall 192.1s)
+  stage-1 harness vs image : 174 passed, 0 failed
+  smoke vs image        : 46/46 ALL PASS
+  D1 offline            : DNS gaierror, TCP OSError (confirmed blocked)
+
+Route table, read from INSIDE image 980c679f1f76 (Core's new pre-check)
+  / ['GET']
+  /_test/export ['GET']
+  /_test/import ['POST']
+  /_test/reset ['POST']
+  /activity ['GET']
+  /auth/login ['POST']
+  /auth/signup ['POST']
+  /authorizations ['GET', 'POST']
+  /authorizations/{authorization_id} ['GET']
+  /authorizations/{authorization_id}/capture ['POST']
+  /authorizations/{authorization_id}/void ['POST']
+  /health ['GET']
+  /me ['GET']
+  /payments ['POST']
+  /requests ['GET', 'POST']
+  /requests/{request_id}/cancel ['POST']
+  /requests/{request_id}/decline ['POST']
+  /requests/{request_id}/pay ['POST']
+  /settlements ['POST']
+  /splits ['POST']
+
+  Note: /void exists here. Void was added in W5 (6226ed1), a descendant of
+  f89e0a4, so it is absent from w4 (741ae47f6f2e). Any behavioural claim about
+  void on a W4 artifact would be impossible; Core's W4 void finding stands.
+
+Amended D3 legs (all present, three verified to fail against 6f07f4e)
+  (a) export carries no `tokens` key, and no bearer token appears anywhere in
+      the serialised payload
+  (b) a live session survives export -> import -> /me 200
+  (c) a pre-existing live session for a user absent from the imported users
+      returns 401 after import
+  plus: rejected import leaves sessions and authorizations identical by value;
+        export -> import -> export reaches a fixed point.
+
+Teeth check — these three FAIL against the pre-amendment store.py at 6f07f4e:
+  test_the_export_carries_no_tokens_and_no_bearer_token_anywhere
+  test_a_tokens_key_in_the_payload_is_ignored_not_honoured
+  test_a_live_session_for_a_user_the_import_removes_is_dropped
+Run by stashing only stage-2/app/store.py; 3 failed, 2 passed.
+
+Session semantics now shipped
+  - full export preserves live sessions for surviving handles
+  - a live token whose handle the import removes is dropped
+  - a `tokens` key in the payload is ignored, not honoured
+  - reset and bare-fixture imports start token-free
+
+KNOWN GAP, tracked not hidden
+  xfail(strict) test_a_rejected_import_changes_nothing_known_gap_request_amount
+  An imported pending request's `amount` is unvalidated — not for type, not for
+  sign, not for presence — while its `status` and both handles are re-validated.
+  A crafted export can inject a pending request with a negative amount. Not a
+  session or authorization defect, and outside the amended D3 clause, so it is
+  recorded as a failing-by-design test rather than fixed inside a gate-bound
+  commit. Core owns the scoping call; the test flips to failing-loudly (strict
+  xpass) the moment the validator checks amount.
+
+BEHAVIOUR ASYMMETRY NEEDING CORE'S EXPLICIT RULING
+  A stage-1 snapshot has no `authorizations` key. Because the payload is the
+  world, importing one RELEASES an existing hold (observed: held 500 -> 0),
+  while the session survives the same import. Sessions live server-side and
+  SPEC.md line 151 singles them out; a hold is absent from the payload, so it
+  cannot be restored and is not invented. This is deliberate but was not
+  addressed by the amended D3 clause, so it is flagged rather than assumed.
+
+Artifact history (nothing pruned, no tag re-pointed)
+  w4           741ae47f6f2e  f89e0a4   superseded, verdict WITHDRAWN by Core
+  w4-verify    ad54b473f333            superseded
+  w5           4eeb3e45fc85  6226ed1   VULNERABLE, must never ship
+  w6           01bf6c15cc94  ca71a9d   superseded
+  w6b          b693eed4a6ef  6f07f4e   superseded
+  w6c          980c679f1f76  1601616   CURRENT
+  latest       980c679f1f76            cosmetic only, permanently banned as a
+                                       gate target
