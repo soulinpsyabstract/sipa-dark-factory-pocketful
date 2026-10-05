@@ -78,7 +78,13 @@ Export carries no credentials:
 - test_a_payload_tokens_key_is_ignored_entirely
 - test_a_payload_tokens_key_cannot_mint_a_session_for_another_user
 - test_an_old_export_carrying_tokens_cannot_wipe_sessions
-- test_a_structurally_broken_tokens_key_is_ignored_not_refused
+
+A structurally malformed `tokens` key is refused with `422`, and the refusal is
+atomic. This replaced `test_a_structurally_broken_tokens_key_is_ignored_not_refused`,
+which asserted the opposite rule and was deleted at `0f73ecb`:
+
+- test_a_structurally_malformed_tokens_key_is_refused
+- test_refusing_a_malformed_tokens_key_changes_nothing
 
 Sessions survive, and are dropped for deprovisioned handles:
 

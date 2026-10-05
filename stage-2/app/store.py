@@ -537,8 +537,70 @@ class Store:
     # fixture handling (reset / import share this)
     # ------------------------------------------------------------------
 
-    def _install_fixture(self, fixture: dict[str, Any]) -> None:
-        """Replace the entire world. Atomic: callers hold the lock."""
+    def _credential_from_import(self, entry: dict[str, Any], handle: str) -> str:
+        """The credential an imported user gets. Never the payload's bcrypt hash.
+
+        The rule: an import preserves the *live* stored credential and never
+        authenticates from the payload. `SPEC.md:150-151` names what must
+        survive an upgrade - the browser's session (`:151`), pending requests
+        and their retry identity (`:152-157`). A password is not on that list,
+        and the same reading governs `authorizations`: a thing the spec does not
+        name as payload-carried is not carried by an import. `SPEC.md:215` makes
+        the parallel explicit for holds, where omission is defined to mean "no
+        holds" rather than "leave the holds alone".
+
+        Two consequences, both pinned in the tests:
+
+        * A tampered `password_hash` is inert rather than destructive. Under
+          the old behaviour - honouring the payload - an import could hand an
+          attacker any account by writing one bcrypt digest, and could lock the
+          real owner out. Now neither is reachable: the digest is discarded, so
+          the owner's password keeps working and the attacker's never does.
+        * Export -> import -> login is still a true round trip, because the
+          live world already holds the right digest for every surviving handle.
+          That is what makes this a *restore* rule and not a *disable login*
+          rule, and it is why the test asserts the owner's `200` alongside the
+          attacker's `401` rather than only the latter.
+
+        A handle that is new to this service has no live credential to preserve,
+        so it falls back to the payload's plaintext `password` when one is given
+        and to the shared fixture default otherwise. That keeps a stage-1 export
+        importable into a virgin service, where nothing exists to preserve.
+
+        Note the asymmetry with `/_test/reset`, which *does* install the
+        payload's digest: a reset is a bootstrap with no live world, not a
+        restore onto one.
+        """
+        live = self.users.get(handle)
+        if live is not None and is_bcrypt_hash(live.get("password_hash")):
+            return str(live["password_hash"])
+
+        password = entry.get("password")
+        if password is None:
+            password = DEFAULT_FIXTURE_PASSWORD
+        if not isinstance(password, str) or not password:
+            raise validation_error(f"password for {handle!r} must be a non-empty string")
+        return _fixture_password_hash(password)
+
+    def _install_fixture(
+        self, fixture: dict[str, Any], *, honour_password_hash: bool = True
+    ) -> None:
+        """Replace the entire world. Atomic: callers hold the lock.
+
+        ``honour_password_hash`` is the credential rule, and it differs between
+        the two callers on purpose:
+
+        ``POST /_test/reset`` is a *bootstrap*. There is no live world yet, so
+        the payload's ``password_hash`` is the only credential that exists and
+        it must be installed verbatim.
+
+        ``POST /_test/import`` is a *restore*. The live world already holds a
+        credential for every surviving handle, so an imported
+        ``password_hash`` is inert: it is never installed, never used to
+        authenticate, and cannot lock a user out. See
+        ``_credential_from_import`` for the reasoning and the fallback for
+        handles that are new to this service.
+        """
         raw_users = fixture.get("users", [])
         if not isinstance(raw_users, list):
             raise validation_error("fixture 'users' must be a list")
@@ -569,11 +631,14 @@ class Store:
                 raise validation_error(f"balance for {handle!r} must not be negative")
 
             # A payload produced by /_test/export already carries a bcrypt
-            # digest, so it is restored verbatim; only a fixture that supplies
-            # a plaintext `password` is hashed here. This is what makes
-            # export -> import -> login a true round trip.
+            # digest. On a *reset* that digest is installed verbatim, which is
+            # what makes export -> reset -> login a true round trip. On an
+            # *import* the live credential wins instead; see
+            # `_credential_from_import`.
             existing_hash = entry.get("password_hash")
-            if is_bcrypt_hash(existing_hash):
+            if not honour_password_hash:
+                password_hash = self._credential_from_import(entry, handle)
+            elif is_bcrypt_hash(existing_hash):
                 password_hash = existing_hash
             else:
                 password = entry.get("password")
@@ -997,7 +1062,7 @@ class Store:
                 return self._install_full_export(payload, saved.get("tokens") or {})
 
             if "users" in payload or "balances" in payload or "seeded_total" in payload or "total" in payload:
-                self._install_fixture(payload)
+                self._install_fixture(payload, honour_password_hash=False)
                 return self._export()
         except Exception:
             self._restore_state(saved)
@@ -1022,7 +1087,8 @@ class Store:
                 "users": payload.get("users", []),
                 "balances": payload.get("balances", {}),
                 "seeded_total": payload.get("seeded_total", payload.get("total")),
-            }
+            },
+            honour_password_hash=False,
         )
 
         requests_payload = payload.get("requests") or []

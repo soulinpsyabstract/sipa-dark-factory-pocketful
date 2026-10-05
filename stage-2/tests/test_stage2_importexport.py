@@ -91,7 +91,31 @@ def test_a_stage1_export_imports(client):
 
 
 def test_a_stage1_export_leaves_no_holds_behind(client):
+    """Half one of the hold rule, and the direction SPEC.md:215 requires.
+
+    "An earlier fixture may omit ``authorizations`` altogether; omission means an
+    empty list." A stage-1-shaped payload therefore carries no holds, so
+    ``held = 0`` and ``available = total`` - the 800 minor units go back to
+    spendable *because the payload says there are none*, not because import
+    failed to notice them.
+
+    The inverse half is ``test_a_deprovisioning_fixture_drops_the_removed_payers_hold``.
+    Together they pin that "absent" and "empty" are the same thing here, while a
+    genuine deprovisioning also drops the removed payer's hold.
+    """
+    # Establish a live hold FIRST. Without this the assertion is trivially
+    # true - the fixture starts with held == 0, so "held is 0 after import"
+    # proves nothing about what import did. With the hold in place, this is
+    # the leg that fails if a wrong rule preserves holds on an absent key.
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k1"),
+    )
+    assert wallet(client, "ada") == (2000, 800, 1200), "precondition: a live hold must exist"
+
     do_import(client, STAGE1_EXPORT)
+
     assert wallet(client, "ada") == (2000, 0, 2000)
 
 
@@ -307,6 +331,85 @@ def test_a_deprovisioning_import_still_signs_the_removed_user_out(client):
     assert client.get("/me", headers=ada).status_code == 401, (
         "a deprovisioning import left the removed user authenticated"
     )
+
+
+def test_a_deprovisioning_fixture_drops_the_removed_payers_hold(client):
+    """The negative control for the hold rule, in the direction SPEC.md:215 wants.
+
+    ``test_a_stage1_export_leaves_no_holds_behind`` pins one half: a payload with
+    no ``authorizations`` key must release, because ``:215`` makes omission an
+    empty list. This pins the other half, which is what stops that rule from
+    degenerating into a blanket refusal.
+
+    A fixture that *does* deprovision - an explicit ``authorizations: []`` and a
+    payer who is no longer in ``users`` - must drop that payer's hold. The two
+    cases look similar and must behave differently:
+
+    ==========  ==================  ======================
+    payload     payer in users     required outcome
+    ==========  ==================  ======================
+    key absent  present             hold released (omission = empty)
+    ``[]``      present             hold released (explicit empty)
+    ``[]``      removed             hold dropped (deprovisioned)
+    key present present             hold preserved
+    ==========  ==================  ======================
+
+    Both halves matter. An implementation that treats an absent key as "no
+    opinion" passes a suite that never creates a live hold before importing a
+    stage-1 payload, and an implementation that treats an explicit ``[]`` as
+    "no opinion" passes a suite that never checks the deprovisioning leg. Either
+    is a real defect: the first leaks a double-spend, the second reserves funds
+    against a user who no longer exists.
+    """
+    ada = login(client, "ada")
+    bob = login(client, "bob")
+
+    # One live hold, so leg one is observable from a surviving user and leg two
+    # from the exported world. bob starts on zero, so ada is the payer.
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(ada, "k1"),
+    )
+    assert wallet(client, "ada") == (2000, 800, 1200), "precondition: ada must hold"
+
+    payload = export(client)
+    payload["authorizations"] = []
+    assert do_import(client, payload).status_code == 200
+
+    # Leg one: explicit empty, the payer still present -> the hold is released.
+    assert wallet(client, "ada") == (2000, 0, 2000), (
+        "an explicit empty authorizations list did not release the hold"
+    )
+
+    # Leg two: same payload, but the payer is deprovisioned too -> nothing may
+    # survive, and the world must come back empty rather than dangling.
+    client.post(
+        "/authorizations",
+        json={"to_handle": "bob", "amount": 800},
+        headers=auth(login(client, "ada"), "k2"),
+    )
+    assert wallet(client, "ada") == (2000, 800, 1200), "precondition: a live hold again"
+
+    payload = export(client)
+    payload["users"] = []
+    payload["balances"] = {}
+    payload["seeded_total"] = 0
+    payload["authorizations"] = []
+    # Everything else that names a handle has to go too, or the import is
+    # rightly refused for referencing a user that no longer exists and we
+    # never reach the hold assertions.
+    payload["requests"] = []
+    payload["activity"] = []
+    payload["idempotency"] = []
+    assert do_import(client, payload).status_code == 200
+
+    after = export(client)
+    assert after["authorizations"] == [], (
+        f"a deprovisioned payer's hold survived: {after['authorizations']}"
+    )
+    assert after["users"] == [], "the deprovisioning import left users behind"
+    assert after["seeded_total"] == 0
 
 
 # ----------------------------------------------------------------------
@@ -546,46 +649,95 @@ def test_the_export_carries_no_tokens_and_no_bearer_token_anywhere(client):
     assert client.get("/me", headers=auth(ada)).status_code == 200
 
 
-def test_an_imported_password_hash_is_honoured_so_a_taken_over_account_works(client):
-    """Pins the architectural consequence of ``/_test/import`` honouring a
-    ``password_hash``.
+def test_an_imported_password_hash_is_inert_so_no_account_can_be_taken_over(client):
+    """Import preserves the live credential; it never authenticates from the payload.
 
-    An earlier belief was that import *refuses* an imported ``password_hash``,
-    which would make the test namespace safe against account takeover. That is
-    wrong, and the reason it looked right is worth recording: the app pre-hashes
-    with SHA-256 before bcrypt (``security._prehash``), so a hash built the
-    naive way - ``bcrypt(pw)`` - never verifies and login returns 401. That 401
-    was read as a defence. It is not. An attacker who reads ``security.py``
-    builds ``hash_password(their_own_password)``, imports it, and logs in.
+    The ruling: an imported ``password_hash`` is ignored. It is not installed,
+    not used to authenticate, and therefore neither an attack primitive nor a
+    lockout.
 
-    Measured on a clean ``--network none`` container::
+    Both halves are asserted, and the second is the one that keeps this a
+    *restore* rule rather than a *disable login* rule:
+
+    * attacker 401 - the injected digest grants nothing;
+    * owner 200 - the live credential survived the import untouched, so an
+      unmodified export still round-trips to a working login.
+
+    Measured on a clean ``--network none`` container before the fix, with an
+    attacker-chosen digest built the correct way (``hash_password``, which
+    applies the SHA-256 pre-hash the app uses)::
 
         baseline login as ada .................. 200
         import with rewritten password_hash .... 200
         login as ada with ATTACKER's password .. 200   <- takeover
         login as ada with her real password .... 401   <- locked out
 
-    This is the same full-authority property as minting users and balances, and
-    it is bounded by the same rule: ``/_test/*`` must never be reachable on a
-    network. The test asserts the takeover *works* on purpose. If someone later
-    adds authentication to the import surface, this fails and they should read
-    the failure as "the ledger entry needs updating", not as a regression.
+    After the fix, same payload::
+
+        baseline login as ada .................. 200
+        import with rewritten password_hash .... 200
+        login as ada with ATTACKER's password .. 401
+        login as ada with her real password .... 200
+
+    The reason the earlier 401 looked like a defence is worth recording: a naive
+    ``bcrypt(pw)`` digest never verifies against ``security._prehash`` and so
+    returned 401 regardless. That was an accident of the pre-hash, not a
+    property of the import path. ``hash_password`` is a public function in the
+    same module, so the real attack needs nothing an attacker does not have.
+
+    The reasoning behind the ruling, in one line: ``SPEC.md:150-151`` names what
+    must survive an upgrade - the browser session (``:151``), pending requests
+    and their retry identity (``:152-157``). A password is not on that list. The
+    same reading governs ``authorizations``, where ``:215`` explicitly makes
+    omission mean "no holds" rather than "leave them alone".
     """
     snap = export(client)
     hijack = hash_password("attacker-chosen-password")
     assert verify_password("attacker-chosen-password", hijack)
-    assert not verify_password(PW, hijack)
+    assert not verify_password(PW, hijack), "the attacker's digest must not match ada's password"
 
     for user in snap["users"]:
         if user["handle"] == "ada":
             user["password_hash"] = hijack
     assert do_import(client, snap).status_code == 200
 
-    assert client.post("/auth/login", json={"email": "ada@example.com", "password": PW}).status_code == 401
-    r = client.post(
+    attacker = client.post(
         "/auth/login", json={"email": "ada@example.com", "password": "attacker-chosen-password"}
     )
-    assert r.status_code == 200, "import stopped honouring password_hash; update the ledger"
+    assert attacker.status_code == 401, (
+        "import installed a password_hash from the payload; /_test/import can take over any account"
+    )
+
+    owner = client.post("/auth/login", json={"email": "ada@example.com", "password": PW})
+    assert owner.status_code == 200, (
+        "import discarded the live credential; an unmodified export no longer round-trips to a login"
+    )
+
+
+def test_an_unmodified_export_still_round_trips_its_own_logins(client):
+    """The other half of the credential rule, isolated from any tampering.
+
+    A ruling of "import ignores ``password_hash``" can be implemented two ways:
+    by preserving the live credential, or by discarding credentials wholesale.
+    The second also makes the attacker's login fail, so only this test tells
+    them apart - it imports an untouched export and requires every seeded login
+    to keep working.
+
+    Measured on a clean ``--network none`` container::
+
+        login before import ................. 200 200 200
+        import of an unmodified export ...... 200
+        login after import .................. 200 200 200
+    """
+    before = {h: client.post("/auth/login", json={"email": f"{h}@example.com", "password": PW}).status_code
+              for h in ("ada", "bob", "cyd")}
+    assert before == {"ada": 200, "bob": 200, "cyd": 200}, "precondition: all three must log in"
+
+    assert do_import(client, export(client)).status_code == 200
+
+    after = {h: client.post("/auth/login", json={"email": f"{h}@example.com", "password": PW}).status_code
+             for h in ("ada", "bob", "cyd")}
+    assert after == before, "an unmodified export stopped round-tripping its own logins"
 
 
 def test_invariants_hold_after_import(client):
@@ -710,6 +862,51 @@ def test_an_imported_request_amount_is_validated_like_the_write_path(client):
             f"import accepted requests.amount={value!r} ({r.status_code}); "
             "the write path would refuse it"
         )
+
+
+def test_a_string_imported_amount_is_a_422_not_a_500(client):
+    """The string leg on its own, because it was a 500 rather than an inconsistency.
+
+    A negative amount is a *wrong value*: it imports and then pays backwards, a
+    money defect. A string amount is a different class of failure - it is a
+    Python ``TypeError`` raised out of ``_require_available`` on the *pay* path,
+    propagating as an unhandled 500. So it is pinned separately rather than as
+    one more entry in the table above:
+
+      * the finding was that a 500 is reachable through **unauthenticated**
+        ``POST /_test/import``, which is its own problem independent of the
+        value being wrong;
+      * a negative amount fails loudly and visibly at import. A string amount
+        sat dormant in an accepted import and detonated later, on an unrelated
+        request, with a stack trace instead of a status code.
+
+    Measured on ``980c679f1f76`` before the fix::
+
+        import {"amount": "500"} .................. 200
+        POST /requests/{id}/pay ................... 500   <- TypeError
+    """
+    bob = login(client, "bob")
+    login(client, "ada")
+
+    payload = export(client)
+    payload["requests"].append(
+        {"id": "r_str", "from": "ada", "to": "bob", "status": "open", "amount": "500"}
+    )
+    r = do_import(client, payload)
+    assert r.status_code == 422, (
+        f"import accepted a string amount ({r.status_code}); it detonates as a "
+        "500 later, on the pay path, from an unauthenticated import"
+    )
+
+    # And it must be a clean rejection, not a half-applied world: the string
+    # request must not exist afterwards, and the real one must still pay.
+    # bob has no funds, so ada is the payer here: bob requests, ada pays.
+    real_id = client.post(
+        "/requests", json={"to": "ada", "amount": 500}, headers=auth(bob, "rq2")
+    ).json()["id"]
+    pay = client.post(f"/requests/{real_id}/pay", json={}, headers=auth(login(client, "ada"), "pay1"))
+    assert pay.status_code in (200, 201), pay.text
+    assert pay.json()["amount"] == 500, "a real amount must not be coerced"
 
 
 def test_an_imported_negative_request_amount_cannot_be_paid_backwards(client):

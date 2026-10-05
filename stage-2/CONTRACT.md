@@ -85,8 +85,10 @@ tokens, counters) with the fixture. Atomic.
 }
 ```
 
-`password_hash` is a bcrypt digest, exported so a seeded user survives an
-export → import → login round trip. Never plaintext.
+`password_hash` is a bcrypt digest. Never plaintext.
+
+An export therefore remains a **secret-bearing file**: it contains every seeded
+account's password verifier. That is load-bearing, not incidental — see §4.
 
 ## 4. `POST /_test/import`
 
@@ -95,10 +97,35 @@ Accepts **either** shape:
 * a full export (§3) — restored verbatim, including requests, activity and
   idempotency records, so export → import → export is a true round trip;
 * a bare fixture (`{"users": […], "seeded_total": n}`) — same semantics as
-  `/_test/reset`.
+  `/_test/reset`, except for the credential rule below.
 
 Invalid or invariant-breaking payloads are `422`, and the previous state is
 left intact (import is all-or-nothing).
+
+### 4.1 Credentials are never carried by an import
+
+An imported `password_hash` is **inert**. Import preserves the live stored
+credential for every surviving handle and never authenticates from the
+payload, so:
+
+* a tampered `password_hash` grants nothing — it cannot hand an account to an
+  attacker, and it cannot lock the real owner out;
+* an unmodified export still round-trips to working logins, because the live
+  world already holds the correct digest.
+
+A handle that is **new** to this service has no live credential to preserve. It
+falls back to the payload's plaintext `password` when one is present, and to
+the shared fixture default (`pocketful-fixture-pw`) otherwise.
+
+The rule is deliberately asymmetric with `POST /_test/reset` (§2), which *does*
+install the payload's digest: a reset is a bootstrap with no live world, not a
+restore onto one.
+
+Because exports still contain real bcrypt digests, they are credential-bearing
+and must be treated as secrets. Every other `/_test/*` capability — minting
+users, setting balances, erasing the world — is unrestricted in the same way.
+The one control is that `/_test/*` must never be reachable on a network; that is
+now load-bearing rather than hygiene.
 
 ## 5. `POST /auth/signup`
 

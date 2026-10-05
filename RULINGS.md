@@ -22,6 +22,30 @@ A payload with **no `authorizations` key** carries no holds, so `held = 0` and `
 Absence means "none", not "no opinion". `9bfaae3` reverting `cb18e6e` **stands**. `cb18e6e` was wrong.
 The reverting seat was **not** at fault; Core's item-4 ruling was. Do not reopen.
 
+**Both directions are now pinned, and both were red-proven.** A test that imports a stage-1 payload
+without first creating a hold asserts `held == 0` trivially — the fixture starts at zero — so it
+proves nothing about what import did. `test_a_stage1_export_leaves_no_holds_behind` now establishes a
+live 800 hold *before* the import. The inverse half,
+`test_a_deprovisioning_fixture_drops_the_removed_payers_hold`, covers the cases that look similar and
+must differ:
+
+| payload | payer in `users` | required outcome |
+| --- | --- | --- |
+| key absent | present | hold released (omission = empty) |
+| `[]` | present | hold released (explicit empty) |
+| `[]` | removed | hold dropped (deprovisioned) |
+| key present | present | hold preserved |
+
+Red proof, each break injected at the real dispatch point in `store.py`:
+
+| injected wrong rule | caught by |
+| --- | --- |
+| absent key preserves live holds (`cb18e6e`) | `..._stage1_export_leaves_no_holds_behind` → `(2000, 800, 1200)` != `(2000, 0, 2000)` |
+| explicit `[]` preserves live holds (blanket refusal) | `..._deprovisioning_fixture_drops_the_removed_payers_hold` → `(2000, 800, 1200)` != `(2000, 0, 2000)` |
+
+Without the first break the old stage-1 test passed for the wrong reason; without the second the whole
+suite passed with a blanket refusal in place. Neither defect was visible before these pins.
+
 ## R2 — `tokens` key. SETTLED, CORRECTED 2026-10-05 (the first wording was wrong).
 
 **An earlier version of this ruling listed `list` among the malformed shapes. That was wrong, and the
@@ -55,21 +79,52 @@ Stage-1 compat is unaffected: Stage-1 exports carry no `tokens` key at all.
 with the two halves above, plus `test_refusing_a_malformed_tokens_key_changes_nothing` so the `422`
 cannot cost a caller their world.
 
-## R3 — `/_test/*` is full authority, including credential takeover. SETTLED.
-Not "test namespace". Not "mints users and money".
+## R3 — Import never authenticates from the payload. SUPERSEDES the earlier R3.
+**Credential takeover via `/_test/import` is closed.** The earlier ruling recorded the opposite and
+is withdrawn; see the correction note below.
 
-- `stage-2/app/store.py:474-476` — `existing_hash = entry.get("password_hash"); if is_bcrypt_hash(existing_hash): password_hash = existing_hash`
-- `stage-2/app/security.py:23-25` — `_prehash` = SHA-256 → base64 **before** bcrypt.
+**The rule: an imported `password_hash` is inert. Import preserves the live stored credential and
+never authenticates from the payload.**
 
-**An unauthenticated `/_test/import` can take over any existing account and lock out its owner.**
-Measured: attacker `200`, owner `401`. The namespace is spec-required (`SPEC.md:211` mandates
-`POST /_test/reset`), so removal is not available. Mitigation is deployment and documentation:
-**it must never be reachable from a network.** Exports carry real bcrypt hashes, so they are
-credential-adjacent artifacts and must be treated as secrets.
+- `stage-2/app/store.py` — `Store._credential_from_import` returns the live digest for a surviving
+  handle; `_install_fixture(honour_password_hash=False)` is the import path, `True` is the reset path.
 
-`e8296fc` pins this deliberately, as a tripwire whose failure message says "update the ledger".
-**A passing `..._a_taken_over_account_works` test is a documented dangerous property, never an
-endorsed security control.** The gate must not score it as a satisfied leg.
+Two halves, both pinned:
+
+- injected `hash_password(attacker)` → attacker `401`, owner `200` (inert, not destructive);
+- unmodified export → every seeded login still `200` (it is a *restore* rule, not *disable login*).
+
+Measured on `--network none`, before and after:
+
+| payload | before | after |
+| --- | --- | --- |
+| injected digest, attacker login | `200` | `401` |
+| injected digest, owner login | `401` | `200` |
+| unmodified export, owner login | `200` | `200` |
+
+**Why, from the spec text.** `SPEC.md:150-151` names what must survive an upgrade: the browser session
+(`:151`), pending requests and their retry identity (`:152-157`). A password is not on that list. The
+same reading governs `authorizations`, where `:215` explicitly defines omission as "no holds" rather
+than "leave the holds alone". A secret the spec does not name as payload-carried is not carried by an
+import.
+
+**Asymmetry with `/_test/reset`.** Reset still installs the payload's digest verbatim: it is a
+bootstrap with no live world, not a restore onto one.
+
+**Residual: exports are still secrets.** They carry real bcrypt digests. Minting users, setting
+balances and erasing the world remain unrestricted. **The single control is that `/_test/*` must never
+be reachable from a network** — now load-bearing rather than hygiene.
+
+### Correction: what `e8296fc` recorded, and why it was wrong
+`e8296fc` pinned "an imported `password_hash` is honoured, so `/_test/import` is full authority
+including account takeover", on the measured result attacker `200` / owner `401`. That measurement was
+correct. The inference drawn from it — that import must honour the digest — was not, because it
+treated the observed behaviour as the rule rather than as a defect in it. The earlier probe's `401`
+was read as a defence for a different reason: it used a raw `bcrypt.hashpw`, which cannot verify
+against `security._prehash` (SHA-256 → base64 before bcrypt) and so returned `401` regardless of the
+import path. `hash_password` is a public function in the same module, so the real attack needed
+nothing an attacker did not have. The tripwire is now inverted and `..._a_taken_over_account_works`
+is replaced by `test_an_imported_password_hash_is_inert_so_no_account_can_be_taken_over`.
 
 ## R4 — Imported money fields. SETTLED; both halves closed.
 Two validators, deliberately not one:
@@ -84,6 +139,13 @@ authorization has captured nothing, so `captured_amount = 0` is legal; reusing
 `validate_imported_amount` would have rejected a correct state. `captured=0` → `200`,
 `captured=350` with `remaining=350|700` → `200`; `-500`, `'x'`, `True`, `-1`, `1.5` → `422`; and a
 refused capture changes nothing.
+
+**The string leg is pinned as its own case**, not as one more row in the `bad` table:
+`test_a_string_imported_amount_is_a_422_not_a_500`. A negative amount is a *wrong value* that fails
+loudly at import; a string amount is a different class — a `TypeError` out of `_require_available` on
+the **pay** path, propagating as an unhandled `500` from an **unauthenticated** import. On
+`980c679f1f76` it imported `200` and detonated later, on an unrelated request, with a stack trace
+instead of a status code.
 
 `settlements` and `splits` are **not export collections** and have nothing to validate. Their money
 rides on `authorizations.amount` and `activity.amount`. Measured export keys: `activity`,
