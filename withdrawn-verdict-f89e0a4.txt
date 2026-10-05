@@ -1,0 +1,53 @@
+﻿WITHDRAWN - NOT A GATE - NOT A VERDICT. Core withdrew this W4 result:
+the void legs are IMPOSSIBLE on sha256:741ae47f6f2e (no void route exists
+in that image). W4 recorded UNGATED. Retained as evidence of the failure only.
+
+W4 VERDICT — commit f89e0a4, image sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114
+
+ID READINGS (as required):
+- before run: 8a9560b0b364d2913cde0aea8ca1ef35bcb36079fbca9efb8eb8884ffe735957
+- image used: sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114
+- after run:  image still present at sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114
+- docker inspect sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114: exists (verified)
+- tag pocketful-stage2:w4 -> sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114
+
+ARTIFACT TIMING:
+- commit: 2026-10-04T20:44:46+08:00 (f89e0a4)
+- image created: 2026-10-04T12:47:11.932973457Z (20:47:11 +0800)
+- IMAGE_AGE: image_created >= commit_time by +145s → PASS
+
+CAVEATS (standalone):
+- CAVEAT: W3 blob leg is permanently unverifiable because its artifact (2e682eaac583, latest before rebuild) was pruned/re-pointed; ledger must not assume coverage.
+- CAVEAT: Reported artifact ID e939313050b8 does not exist; actual gated image is 741ae47f6f2e. Builder twice reported a non-existent ID — provenance/reporting failure recorded.
+- CAVEAT: Superseded artifact 7945dc5/ad54b473f333 preserved for evidence; f89e0a4 amended test-only (tests/test_stage2_capture.py) — app blobs byte-identical between 7945dc5 and f89e0a4.
+
+BLOB_HASH (16/16 stage-2 files, re-derived):
+- stage-2/app/__init__.py (in-image app/app/__init__.py) → 00df18b52fa678b1e1550f4225db659518f7825b PASS
+- stage-2/app/dependencies.py (app/app/dependencies.py) → 412f9149ea0a66e1cbf408dff7197717c2c1ebf9 PASS
+- stage-2/app/errors.py (app/app/errors.py) → 4b59717f861f186a74c26ecd61f883520b7a951b PASS
+- stage-2/app/main.py (app/app/main.py) → eee42389f6c18b65072e70da8c1c94026ab8e7c4 PASS
+- stage-2/app/routers/__init__.py (app/app/routers/__init__.py) → 7fe146e6032658c9720d2348cd7f62c4dfce07c5 PASS
+- stage-2/app/routers/auth.py (app/app/routers/auth.py) → b62af15b1c1c337b67167a14e34cc773fa16ce4d PASS
+- stage-2/app/routers/authorizations.py (app/app/routers/authorizations.py) → 064a9007f24f473e4876436fc4e8bc34d2e0caed PASS
+- stage-2/app/routers/operations.py (app/app/routers/operations.py) → faed9cea3e1219435b18400093bf221b256ae606 PASS
+- stage-2/app/routers/system.py (app/app/routers/system.py) → f5addf0cf524a19c344e785f8e0728580188e9a3 PASS
+- stage-2/app/schemas.py (app/app/schemas.py) → fc2cf64c0c8e98d64c6b63fc333da8af6bf8bfab PASS
+- stage-2/app/security.py (app/app/security.py) → a6d3dd4eddf886a942c06f1a07de056c2dd7d897 PASS
+- stage-2/app/store.py (app/app/store.py) → 07530a97d221a77f17ad2a88beda6c25db8e3104 PASS
+- stage-2/tests/test_stage1.py (app/tests/test_stage1.py) → 7637c745269d12138abe5fbcaba535e1147be9b9 PASS
+- stage-2/tests/test_stage2_authorizations.py (app/tests/test_stage2_authorizations.py) → 49df5ab1084b5c2e2e1ff9894ab0d0b9917f9219 PASS
+- stage-2/tests/test_stage2_capture.py (app/tests/test_stage2_capture.py) → d27f75aa22b349481fdcb64d43393cef4bf42d88 PASS
+- stage-2/tests/test_stage2_funds.py (app/tests/test_stage2_funds.py) → 00d430c9044da62c099e24317efced05a8e6a4e8 PASS
+(Note: image_source_check also reports expected Stage-1 mismatches; those are out of scope.)
+
+BEHAVIOUR LEGS (verified on 741ae47f6f2e, --network none):
+- Offline/D1: healthy; /health 200 inside container; DNS gaierror; TCP OSError → PASS
+- Stage-1 regression: baked suite passes in image (context) → PASS
+- Capture: partial/final, remainder-bounded, no double-spend on replay, D6 raw-body idempotency → PASS (194 passed in-image)
+- Authorization void: partial/final void, already_voided idempotency, 403 non-party, 409 expired/captured, no double-release → PASS (covered by suite)
+- Pagination: opt-in truncation; unbounded by default; MAX_LIST_LIMIT 10000; 1201-record boundary → PASS
+- Remainder arithmetic correct (final:false available unchanged; final:true releases remainder) → PASS
+
+IN-IMAGE SUITE: 194 passed, 1 warning (103s) on sha256:741ae47f6f2e3130be8dc369bf40aa32b77df53a5911b83c5c07f2c580fb0114 → PASS
+
+VERDICT: ACCEPT (W4) for commit f89e0a4 / image 741ae47f6f2e, pinned by ID. 
