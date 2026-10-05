@@ -455,7 +455,7 @@ receipt — "27/27" alone would leave the other five unaccounted for.
 > **Rule: when a receipt explains an absence, name the construct that performs the exclusion — the
 > `COPY` list, not the ignore file. A plausible mechanism is not a mechanism.**
 
-### Receipt tiers — ### The `e8c0381` authorship question is NOT adjudicated here, and the non-adjudication is the ruling.
+### The `e8c0381` authorship question is NOT adjudicated here, and the non-adjudication is the ruling.
 Two seats share one Git identity, and the instruction stream that would settle it is one in which I am a
 party. **The builder now asserts I authorised the commit, quoting two lines, and that a later message of
 mine reversed that authorisation.** Earlier in the session it asserted it had *declined* the commit.
