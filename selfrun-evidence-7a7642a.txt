@@ -91,3 +91,24 @@ against SPEC rather than assumed:
                                    present only on an incoming open
                                    authorisation; audit checked the creator's
                                    page
+
+Addendum - 066bb0a
+------------------
+G1-G5 re-measured in-image on 066bb0a (image sha256:1601181a8460001af08390c3990a9045b67dc411c33412134dd82e1a8da41929,
+archive sha256 3121d42079ad5e080fd2ce43042f50229f3c6216f6b6579114f707dfb0b4a72f):
+  G1  export omits bearer tokens .............. PASS   14 keys, no tokens substring
+  G2  stage-1-shaped export preserves session .. PASS   import 200, /me 200
+  G3  deprovisioning import drops session ..... PASS   import 200, /me 401
+  G4  explicit EMPTY tokens list authoritative  PASS   import 200, /me 401
+  G5  token naming an absent handle refused .... PASS   import 422
+  in-image suite  372 passed, 1 xfailed
+  JSON byte identity vs f9826c5  36/36
+
+G5 did not pass before 066bb0a. A deprovisioning import that still carries the
+removed user's token has to import and log them out (G3), so that token was
+dropped rather than refused - which also silently accepted a token naming a
+handle that had never existed. 066bb0a separates the two: a handle this import
+removes is dropped, a handle never present is a 422. Both branches are pinned in
+one test, because a payload without requests/activity/idempotency is a bare
+fixture that never reaches the tokens handling and would pass for the wrong
+reason - which is exactly what my first version of that test did.
