@@ -403,12 +403,41 @@ missing .py SOURCE files       0
 The five omissions are build config and documentation excluded by `.dockerignore`. Stating them is the
 receipt — "27/27" alone would leave the other five unaccounted for.
 
-### Three tiers. They are not blurred.
-| tier | contents |
-| --- | --- |
-| **measured by the planner** | the binding above; `stage-2` tree identity across four shas; `latest` unmoved at `829b1807…`; `honour_password_hash`=5 and `_credential_from_import` present *in the image*; the R4 captured/remaining pin present *in the image* |
-| **builder receipts, accepted not reproduced** | `404 tests collected` in-image on `--network none`; `verify_stage1.py` 174/0; stage-1 60; D6 12/12 with 5 red-proof failures at `assert 200 == 409`; six routes `200 text/html`; 0 `<script>`; negotiation 401/404 |
-| **not claimed** | independent verification — **none available; this gate is planner-verified under the documented fallback** — and that every leg was measured by the planner rather than received from the builder |
+### Receipt tiers — corrected. A receipt's *location* decides whether it certifies the artifact.
+
+The first version of this table had two tiers, "measured by the planner" and "builder receipts", and
+that was wrong in a way that flattered the gate. **The distinction is not who measured, it is where.**
+
+| | leg | does it certify the artifact? |
+| --- | --- | --- |
+| **A. measured by the planner, on the artifact** | 27/27 blob binding with the five omissions named; `stage-2` tree identity across four shas; `latest` unmoved; `honour_password_hash`=5 and `_credential_from_import` present *in the image*; R4 pin present *in the image* | **yes** |
+| **B. measured inside the artifact by the builder** | `404 tests collected` and `404 passed in 347.77s` via `docker exec pf11 python -m pytest tests -q --no-header` on `--network none`; `/health` → `{"status":"ok"}`; R3 probe → attacker `401` / owner `200`, same container | **yes** — the artifact is the subject |
+| **C. host-side, by the builder** | `verify_stage1.py` 174/0; stage-1 60; D6 12/12 with 5 red-proof failures; six routes `200 text/html`; 0 `<script>`; negotiation 401/404 | **conditionally** — see below |
+| **D. not claimed** | independent verification | **none available; planner-verified under the documented fallback** |
+
+**Why tier C is only conditional.** It was run on the host, not in the artifact, so it does not
+certify the shipped bytes by the instrument that R7 requires. It transfers *conditionally*, on two
+things:
+
+- *verified:* the host ran the same source. `HEAD:stage-2 == 45bb71b:stage-2 == 2bacd370…`, and the
+  image is blob-identical to the commit for every `.py` file with **0 source files missing** of 25.
+  Same bytes, so a host result is a result *about those bytes*.
+- *unverified:* the environment. The image installs its own dependency set; the host has its own. A
+  host receipt cannot speak to behaviour under different pinned versions.
+
+**So the honest statement is: A and B certify the artifact unconditionally; C certifies the bytes but
+not the environment; D does not exist.** An earlier version of this receipt put B and C in one tier
+and described the whole of it as unrun against an image, which was inaccurate — the 404 was measured
+in the container. Corrected here rather than left to scroll.
+
+### The demonstration R7 asks for, in one pair
+```
+ab15423c   its own suite: 383 passed, inside the image, on --network none
+           the same container: attacker login 200, /me 200 handle=ada
+```
+**An artifact whose tests pass inside itself while it ships unauthenticated account takeover.** That
+pair is R7's argument in full: a green suite is not a gate result, and a receipt is not a
+certification unless it is bound to the bytes by an instrument that varies across the boundary.
 
 ### `sha256:ab15423c…` — PERMANENTLY EXCLUDED, on three independent grounds
 ```
