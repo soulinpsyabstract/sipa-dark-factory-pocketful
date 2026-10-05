@@ -367,6 +367,75 @@ work to commit on request, and it is not this ledger's to spend.
 
 ---
 
+## GATE RECEIPT — Stage 2
+
+```
+tag            pocketful-stage2:w11-45bb71b
+image sha256:  4318dc6a8e7e4a9d69737aaac053453025adc640c14a25e6cb091bd1af76633a
+built from     45bb71b
+frozen at      7f54821   (tree clean)
+stage-2 tree   2bacd3707fd84c3a84aad120f61002c63497e628
+archive        stage2-45bb71b.zip, sha256 E290DE0BBD9E6A43AE90F060D045D9DD74D68C87C63792187B7DEC4C7E78C40B
+```
+
+**Built from `45bb71b`, frozen at `7f54821`, and these are the same artifact.** The receipt cites
+`45bb71b` because that is what was archived; it cites `7f54821` because that is the commit carrying
+this record. They are reconciled by the tree hash, which never changed:
+
+```
+45bb71b:stage-2  309cb8b:stage-2  e8c0381:stage-2  7f54821:stage-2
+all  2bacd3707fd84c3a84aad120f61002c63497e628
+files under stage-2 differing 45bb71b..7f54821:  0
+```
+**No rebuild was spent on `45bb71b` -> `7f54821`, and none should be.** A rebuild would mint a new
+image id for byte-identical content: a receipt that reads more literally while evidencing less.
+
+### Binding, by blob, file by file
+```
+commit stage-2/ files          32
+blob-IDENTICAL                27
+blob-DIFFERING                 0
+in image but not in commit     0
+in commit but not in image     5   -> .dockerignore  .gitignore  CONTRACT.md  Dockerfile  SPEC.md
+missing .py SOURCE files       0
+```
+**Every shipped `.py` is present and blob-identical; nothing in the image is absent from the commit.**
+The five omissions are build config and documentation excluded by `.dockerignore`. Stating them is the
+receipt — "27/27" alone would leave the other five unaccounted for.
+
+### Three tiers. They are not blurred.
+| tier | contents |
+| --- | --- |
+| **measured by the planner** | the binding above; `stage-2` tree identity across four shas; `latest` unmoved at `829b1807…`; `honour_password_hash`=5 and `_credential_from_import` present *in the image*; the R4 captured/remaining pin present *in the image* |
+| **builder receipts, accepted not reproduced** | `404 tests collected` in-image on `--network none`; `verify_stage1.py` 174/0; stage-1 60; D6 12/12 with 5 red-proof failures at `assert 200 == 409`; six routes `200 text/html`; 0 `<script>`; negotiation 401/404 |
+| **not claimed** | independent verification — **none available; this gate is planner-verified under the documented fallback** — and that every leg was measured by the planner rather than received from the builder |
+
+### `sha256:ab15423c…` — PERMANENTLY EXCLUDED, on three independent grounds
+```
+1  its stage-2 tree is 219213f6 == d793922 / 5384329 (byte-identical pair), predating §H and R3
+2  its store.py contains zero honour_password_hash and no _credential_from_import
+3  its own suite reports 383 passed inside it, on --network none
+```
+Ground 3 is the one that makes R7 self-evident: **the artifact shipped unauthenticated account
+takeover while its own tests passed inside it.** Behavioural confirmation, same probe, two images:
+
+```
+4318dc6a (gated)  baseline owner 200 | attacker 401 | owner 200
+ab15423c (excluded)  attacker 200, /me 200 handle=ada | owner 401
+```
+Its `store.py` blob `5078af19…` matches **four** commits and therefore identifies nothing; the
+27-file full-tree compare pins it to the pair. **A partial fingerprint is not an identifier.**
+
+`latest` remains `829b1807…`, unmoved throughout, and is **not** the gate target.
+
+### Unresolved at gate time
+Commit `e8c0381` ("Planner artifact: …") landed with no commit from the planner seat, which had issued
+none. The content was correct and the tree hash proves the shipped bytes were untouched, but git
+cannot resolve who ran it — the identity is shared, per the attribution finding above. **Reported as
+unresolved and sourced to the transcript only. No seat is credited and no seat is charged with it.**
+
+---
+
 ## Core's errors on the record
 
 1. **False quotes attributed to the builder** — retracted without dispute.
