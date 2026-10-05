@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Iterable, TypeVar
 
 from .errors import AppError, insufficient_funds, validation_error
+from .schemas import MAX_AMOUNT
 
 T = TypeVar("T")
 
@@ -117,6 +118,57 @@ def authorization_remaining(record: dict[str, Any]) -> int:
     if isinstance(captured, bool) or not isinstance(captured, int) or captured < 0:
         captured = 0
     return max(0, amount - captured)
+
+
+def validate_imported_amount(
+    value: Any, *, field: str, owner: str
+) -> int:
+    """Reject an amount on the import path that the write path would have rejected.
+
+    The write path validates money through ``schemas.Amount``: a strict ``int``,
+    greater than zero, at most ``MAX_AMOUNT``. Booleans, floats and strings are
+    all refused there, and each refusal is worth ``422``.
+
+    The import path used to assign these fields unchecked, which turned an
+    unvalidated ``requests.amount`` into two separate money faults. A negative
+    amount paid *backwards* - the payer gained and the requester lost what they
+    never agreed to give up - and a string amount raised ``TypeError`` out of
+    ``_require_available``, so ``POST /requests/{id}/pay`` returned 500. Both
+    were reachable through unauthenticated ``POST /_test/import``, and the app's
+    own invariant report called the result healthy, because a transfer that
+    conserves the sum is not a conservation failure.
+
+    An import must be at least as strict as the API it feeds, so this enforces
+    the identical rule rather than a looser import-specific one.
+    """
+    if isinstance(value, bool) or isinstance(value, float):
+        raise validation_error(
+            f"{field} on {owner} must be an integer number of minor units, "
+            f"not {type(value).__name__}",
+            code="validation_failed",
+        )
+    if isinstance(value, str):
+        raise validation_error(
+            f"{field} on {owner} must be an integer number of minor units, "
+            "not a string",
+            code="validation_failed",
+        )
+    if not isinstance(value, int):
+        raise validation_error(
+            f"{field} on {owner} must be an integer number of minor units",
+            code="validation_failed",
+        )
+    if value <= 0:
+        raise validation_error(
+            f"{field} on {owner} must be greater than zero, got {value}",
+            code="validation_failed",
+        )
+    if value > MAX_AMOUNT:
+        raise validation_error(
+            f"{field} on {owner} must be at most {MAX_AMOUNT}, got {value}",
+            code="validation_failed",
+        )
+    return value
 
 
 def is_bcrypt_hash(value: Any) -> bool:
@@ -885,6 +937,13 @@ class Store:
                 raise validation_error(
                     f"exported request {request_id!r} has unknown status {record.get('status')!r}"
                 )
+            # Money, validated exactly as the write path validates it. A
+            # negative amount here pays backwards; a string here 500s on pay.
+            validate_imported_amount(
+                record.get("amount"),
+                field="request amount",
+                owner=f"exported request {request_id!r}",
+            )
             # Re-validate the endpoints against the seeded user set.
             for role in ("from", "to"):
                 handle = record.get(role)
@@ -909,6 +968,14 @@ class Store:
                 raise validation_error("each exported activity entry must be an object")
             entry = dict(entry)
             entry.setdefault("id", self._next_id("activity", "act"))
+            # Activity amounts are money that already moved, so they get the
+            # same rule. The field is absent on non-payment entries.
+            if entry.get("amount") is not None:
+                validate_imported_amount(
+                    entry["amount"],
+                    field="activity amount",
+                    owner=f"exported activity {entry.get('id')!r}",
+                )
             if entry.get("handle") not in self.users:
                 raise validation_error(
                     f"exported activity references unknown user {entry.get('handle')!r}",
@@ -959,6 +1026,14 @@ class Store:
                 raise validation_error(
                     f"exported authorization {auth_id!r} has unknown status {record.get('status')!r}"
                 )
+            # A negative authorization amount used to import 200 and then
+            # contribute nothing to `held`, leaving a record that exists, is
+            # open, and reserves nothing.
+            validate_imported_amount(
+                record.get("amount"),
+                field="authorization amount",
+                owner=f"exported authorization {auth_id!r}",
+            )
             for role in ("from", "to"):
                 handle = record.get(role) or record.get(f"{role}_handle")
                 if not isinstance(handle, str) or handle not in self.users:

@@ -557,36 +557,145 @@ def test_a_rejected_import_changes_nothing(client, poison):
     assert _state(client) == before
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="known gap: imported request 'amount' is unvalidated; Core owns the scoping call",
-)
-def test_a_rejected_import_changes_nothing_known_gap_request_amount(client):
-    """KNOWN GAP, tracked not hidden: an imported request ``amount`` is unvalidated.
+def test_an_imported_request_amount_is_validated_like_the_write_path(client):
+    """An imported ``requests.amount`` is refused unless the API would accept it.
 
-    ``status`` and both handles of an imported pending request are re-validated
-    against the seeded user set, but ``amount`` is not - not for type, not for
-    sign, not even for presence. A crafted export can therefore inject a pending
-    request carrying a negative or non-numeric amount.
+    This was ``xfail(strict)`` while the field went unvalidated. Core measured the
+    consequences on ``980c679f1f76`` and they are worse than an inconsistency:
 
-    This is *not* a session or authorization defect, and it is out of the scope
-    of the amended D3 clause, so it is recorded here as a failing-by-design test
-    rather than fixed silently inside a gate-bound commit. Core owns the scoping
-    call; this test flips to passing the moment the validator checks amount.
+      * ``amount: -500`` imported then paid ran **backwards** - the payer *gained*
+        500 and the requester lost 500 they never agreed to give up. An
+        unauthorized transfer. The app's own invariant report called it healthy,
+        because a transfer that conserves the sum is not a conservation failure,
+        so nothing announced it.
+      * ``amount`` as a string raised ``TypeError`` out of ``_require_available``,
+        propagating to a 500 on ``POST /requests/{id}/pay``.
 
-    Impact is limited by the fact that import is a test-only admin surface and
-    the balance invariants still hold, but "the validator checks two of three
-    fields" is an inconsistency worth closing.
+    Both were reachable through **unauthenticated** ``POST /_test/import``.
+
+    The rule enforced is the write path's own ``Amount``: strict ``int``, greater
+    than zero, at most ``MAX_AMOUNT``. An import must be at least as strict as the
+    API it feeds, so there is deliberately no looser import-specific variant.
     """
+    bad = [
+        -5,                                  # negative: pays backwards
+        0,                                   # not positive
+        "500",                               # string: 500s on pay
+        1.5,                                 # float
+        True,                                # bool is an int subclass in Python
+        2 ** 53,                             # above MAX_AMOUNT
+        None,                                # missing
+    ]
+    for value in bad:
+        payload = export(client)
+        payload["requests"].append(
+            {"id": "r_x", "from": "ada", "to": "bob", "status": "open", "amount": value}
+        )
+        r = do_import(client, payload)
+        assert r.status_code == 422, (
+            f"import accepted requests.amount={value!r} ({r.status_code}); "
+            "the write path would refuse it"
+        )
+
+
+def test_an_imported_negative_request_amount_cannot_be_paid_backwards(client):
+    """The money consequence itself, not just the status code.
+
+    A 422 is only worth something if the inverted payment is genuinely
+    unreachable afterwards. This pins the reachable path end to end: build the
+    bad import, show it is refused, and show the original request is still
+    payable at its own amount with the conservation invariant intact.
+    """
+    # bob requests from ada, so ada is the payer.
+    bob = login(client, "bob")
+    request_id = client.post(
+        "/requests", json={"to": "ada", "amount": 500}, headers=auth(bob, "rq1")
+    ).json()["id"]
+
+    payload = export(client)
+    payload["requests"].append(
+        {"id": "r_x", "from": "ada", "to": "bob", "status": "open", "amount": -500}
+    )
+    assert do_import(client, payload).status_code == 422
+
+    token = login(client, "ada")
+    before = wallet(client, "ada")
+    pay = client.post(f"/requests/{request_id}/pay", json={}, headers=auth(token, "pay1"))
+    assert pay.status_code in (200, 201), pay.text
+    # Paid at its real amount: ada paid 500, she did not gain it.
+    assert pay.json()["amount"] == 500
+    ada_after = wallet(client, "ada")
+    assert ada_after[0] == before[0] - 500, "the payment moved the wrong way"
+
+
+def test_an_imported_negative_authorization_amount_is_refused(client):
+    """An open authorization reserving a negative amount is refused.
+
+    It used to import ``200`` and then contribute nothing to ``held``, leaving a
+    record that exists, is open, and reserves nothing. Core noted this was not
+    directly exploitable; it is still an authorization that claims to hold funds
+    and holds none, and the write path would never have created it.
+    """
+    payload = export(client)
+    payload["authorizations"].append(
+        {"id": "a_x", "from": "ada", "to": "bob", "status": "open", "amount": -3000}
+    )
+    r = do_import(client, payload)
+    assert r.status_code == 422, f"import accepted a negative authorization amount ({r.status_code})"
+
+
+def test_an_imported_activity_amount_is_validated(client):
+    """Activity entries carry money that already moved, so they get the same rule."""
+    token = login(client, "ada")
+    client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(token, "p1"))
+
+    payload = export(client)
+    assert payload["activity"], "needs a populated feed for this to be meaningful"
+    payload["activity"][0]["amount"] = -100
+    r = do_import(client, payload)
+    assert r.status_code == 422, f"import accepted a negative activity amount ({r.status_code})"
+
+
+def test_activity_entries_without_an_amount_still_import(client):
+    """The rule is conditional, so an entry with no amount is left alone.
+
+    Every activity entry currently carries an ``amount`` key, so the absent case
+    is constructed rather than observed.
+    """
+    token = login(client, "ada")
+    client.post("/payments", json={"to": "bob", "amount": 100}, headers=auth(token, "p1"))
+
+    payload = export(client)
+    payload["activity"].append(
+        {"id": "act_x", "handle": "ada", "type": "note", "actor": "ada",
+         "counterparty": None, "direction": None, "related_id": None, "memo": None}
+    )
+    assert do_import(client, payload).status_code == 200
+
+
+def test_negative_balances_are_still_rejected_and_this_did_not_loosen_them(client):
+    """Core confirmed balance validation already worked. Guard against regression.
+
+    The amount work adds validation to ``requests``, ``authorizations`` and
+    ``activity``. It must not have relaxed the existing check on money that
+    actually leaves an account.
+    """
+    for balances in ({"ada": -1, "bob": 2001}, {"ada": 2001, "bob": -1}):
+        r = do_import(client, {"users": [dict(u) for u in USERS], "balances": balances,
+                               "seeded_total": 2000})
+        assert r.status_code == 422, f"import accepted negative balances {balances}"
+
+
+def test_a_rejected_amount_import_changes_nothing(client):
+    """A 422 on the new checks must still be atomic."""
+    _busy_world(client)
+    before = _state(client)
     payload = export(client)
     payload["requests"].append(
         {"id": "r_x", "from": "ada", "to": "bob", "status": "open", "amount": -5}
     )
-    r = do_import(client, payload)
-    assert r.status_code == 422, (
-        "import accepted a request with a negative amount; the validator should "
-        "reject it. If this now fails, close the gap and delete this test."
-    )
+    assert do_import(client, payload).status_code == 422
+    assert _state(client) == before, "a refused import left the world changed"
 
 
 def test_a_rejected_import_leaves_the_session_working(client):
