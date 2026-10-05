@@ -140,6 +140,21 @@ authorization has captured nothing, so `captured_amount = 0` is legal; reusing
 `captured=350` with `remaining=350|700` → `200`; `-500`, `'x'`, `True`, `-1`, `1.5` → `422`; and a
 refused capture changes nothing.
 
+Pinned by `test_imported_captured_and_remaining_amounts_are_validated`. **That pin was added later
+than the fix** — `RULINGS.md` asserted these legs were measured while no test exercised them, which is
+the "named leg with no test behind it" failure, in the ledger rather than in the section map. Red proof:
+restoring the `e8296fc` behaviour (assign both fields straight from the payload) fails the test at
+`captured_amount=-500` → `200`.
+
+Two asymmetries the pin records, because they are not obvious and would be re-broken by a
+"simplification":
+
+- **`remaining_amount = None` is legal and means "not stated"** — the export omits the field on a hold
+  that was never derived, so the import path skips validation rather than rejecting a payload its own
+  export could produce.
+- **`captured_amount = None` is illegal** — the field is defaulted to `0` when absent, so an explicit
+  null is a malformed value, not an omission. → `422`.
+
 **The string leg is pinned as its own case**, not as one more row in the `bad` table:
 `test_a_string_imported_amount_is_a_422_not_a_500`. A negative amount is a *wrong value* that fails
 loudly at import; a string amount is a different class — a `TypeError` out of `_require_available` on
@@ -180,8 +195,10 @@ evidence that the fork existed — never gate it.
 `verdict-6226ed1.txt` — **never created.** W5 is permanently disqualified and never ships.
 `withdrawn-verdict-f89e0a4.txt` tracked at `6a9ed09`. `withdrawn-verdict-48684e8.txt` tracked at
 `43097d3` — a V3 ACCEPT from a seat with no gate authority, permanently removed by operator directive,
-and recording no image ID at all. **No rename is outstanding.** `stash@{0}` is labelled `NOT MINE`,
-holds a duplicate, and is left alone — it is not a seat's work to commit on request.
+and recording no image ID at all. **No rename is outstanding.** The duplicate `stash@{0}` that carried
+it was **dropped**, after confirming via `git ls-files` that the rename was already tracked. The
+remaining `stash@{0}` (`generic mandates and spec injection`) is **left alone** — it is not a seat's
+work to commit on request, and it is not this ledger's to spend.
 
 ---
 

@@ -485,6 +485,89 @@ def test_capture_history_survives(client):
     assert body["remaining_amount"] == 500
 
 
+def test_imported_captured_and_remaining_amounts_are_validated(client):
+    """The derived money fields on an authorization, pinned against import.
+
+    ``amount`` is validated, and this pins the two fields that sit beside it and
+    were not: ``captured_amount`` and ``remaining_amount``. Same bug class as
+    the unvalidated ``requests.amount`` - a bad value here imports ``200`` and
+    persists - and the string leg is the worst of them, because a string in a
+    money field is not a wrong number, it is the wrong *type* in a place the
+    store later compares arithmetically.
+
+    Measured at ``e8296fc``, all importing ``200`` and persisting::
+
+        captured_amount = -500  ->  captured=-500, status='open', remaining=800
+        captured_amount = 'x'   ->  captured='x'
+        remaining_amount = -1   ->  remaining=-1
+
+    Note the first line. ``captured = -500`` on an ``amount = 800`` authorization
+    left a record that was still ``status: open``, reserved the **full** 800 in
+    ``held``, and reported every invariant as healthy. A negative capture is not
+    a conservation failure - the sum still balances - so nothing announced it.
+
+    The rule is deliberately *not* ``schemas.Amount``. Both fields are zero-legal
+    by construction: an authorization nobody has drawn on has
+    ``captured = 0``, and reusing ``validate_imported_amount`` would reject a
+    correct state. The bound is ``0 <= value <= MAX_AMOUNT``, which is
+    ``validate_imported_captured`` at store.py:174.
+    """
+    _busy_world(client)
+
+    # Zero is legal for both. This is the leg that would break if the two
+    # fields were folded into the `amount` rule, so it is asserted first.
+    payload = export(client)
+    for record in payload["authorizations"]:
+        record["captured_amount"] = 0
+        record["remaining_amount"] = 0
+    assert do_import(client, payload).status_code == 200, (
+        "captured_amount=0 is a legitimate authorization nobody drew on"
+    )
+
+    bad = [
+        -500,   # negative: reserved the full amount while reporting open
+        "x",    # string in a money field
+        True,   # bool is an int subclass in Python
+        -1,
+        1.5,
+        2 ** 53,   # above MAX_AMOUNT
+    ]
+    for field in ("captured_amount", "remaining_amount"):
+        for value in bad:
+            payload = export(client)
+            for record in payload["authorizations"]:
+                record[field] = value
+            before = _state(client)
+            r = do_import(client, payload)
+            assert r.status_code == 422, (
+                f"import accepted {field}={value!r} ({r.status_code}); it persists "
+                "into the store and later compares it arithmetically"
+            )
+            assert _state(client) == before, (
+                f"a refused {field}={value!r} left the world changed"
+            )
+
+    # `remaining_amount = None` is *legal* and means "not stated". The export
+    # omits the field on a hold that was never derived, so the import path
+    # skips validation rather than rejecting a payload its own export could
+    # produce. `captured_amount = None` is not legal - it is defaulted to 0 when
+    # absent, so an explicit null is a malformed value, not an omission.
+    payload = export(client)
+    for record in payload["authorizations"]:
+        record["remaining_amount"] = None
+    assert do_import(client, payload).status_code == 200, (
+        "remaining_amount=None means 'not stated' and must import"
+    )
+
+    payload = export(client)
+    for record in payload["authorizations"]:
+        record["captured_amount"] = None
+    assert do_import(client, payload).status_code == 422, (
+        "captured_amount is defaulted to 0 when absent, so an explicit null is "
+        "malformed rather than an omission"
+    )
+
+
 def test_a_voided_authorization_stays_voided(client):
     aid = client.post(
         "/authorizations",
