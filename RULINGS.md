@@ -186,10 +186,33 @@ Incoming `tokens` never authenticates and never de-authenticates. Deprecated acc
 Certification does not transfer across commits. **Re-run every differential at the final tip from that
 tip's own commit.** The `0afd2be` receipt does not certify `e8296fc`.
 
-`1f94fcb` / `w7-token-only` is **not gate-eligible**. It ships `operations.py` with zero raw-byte
-fingerprinting and lacks `test_stage2_idempotency_bytes.py` entirely, while carrying a byte-identical
-commit message to `05f7d8d`. It is contained by no other branch and is the tip of nothing. Preserved as
-evidence that the fork existed — never gate it.
+`1f94fcb` / `w7-token-only` is **not gate-eligible**. It is contained by no other branch and is the tip
+of nothing. It exists solely as evidence that this divergence happened, and it must survive to the next
+reader — so it is **documented here rather than deleted.**
+
+**Why it matters beyond tidiness: it is the only artifact in this repository carrying a byte-identical
+commit message to a good tip and completely different content.** That pair is the cleanest available
+proof of R7 itself. Proven by hashing the message, not by comparing it by eye:
+
+```
+git log -1 --format=%B 1f94fcb | git hash-object --stdin  ->  9ac8b9f89878aff302b69891a9efacf33021da3b
+git log -1 --format=%B 05f7d8d | git hash-object --stdin  ->  9ac8b9f89878aff302b69891a9efacf33021da3b
+```
+
+Measured divergence, `main` vs `1f94fcb`:
+
+| | `main` | `1f94fcb` |
+|---|---|---|
+| `routers/operations.py` `_fingerprint` calls | 6 | 6 |
+| `routers/operations.py` `model_dump` fingerprinting | 0 | **4** |
+| `tests/test_stage2_idempotency_bytes.py` | present | **absent** |
+
+The defect is the four `model_dump` sites: fingerprinting a parsed model compares *values*, so two
+different raw bodies that deserialise identically collide and a divergent retry replays silently
+instead of returning `409`. The `_fingerprint` call count is identical on both, which is why counting
+calls would have missed it — `0afd2be` replaced the `model_dump` arguments, not the calls. The fork
+also lacks §H entirely: `tests/test_stage2_ui_auth_split.py` and `tests/test_stage2_ui_forms.py` are
+absent, 15 files and 3625 lines behind `main`.
 
 ## R8 — Ledger. SETTLED.
 `verdict-6226ed1.txt` — **never created.** W5 is permanently disqualified and never ships.
@@ -240,3 +263,29 @@ be read as evasion.
 Consequence for the gate: **attribution claims must be sourced from the room transcript, never from
 git metadata.** Do not ask a seat to account for a commit it may not have written, and do not treat a
 shared identity as evidence either way.
+
+---
+
+## Verification-skew finding — check the revision, not just the command
+
+Several rulings were re-issued in chat after they had been implemented and committed. The cause was
+mechanical, not a comprehension failure: each message cited a `HEAD` that was a real ancestor, and each
+verification command ran correctly against that stale revision and returned a correct answer about the
+wrong commit.
+
+Two worked examples, reproduced verbatim:
+
+```
+git grep -n password_hash 69585e6 -- 'stage-2/tests/test_stage2_*.py'  ->  NONE
+git grep -n password_hash fb0b881 -- 'stage-2/tests/test_stage2_*.py'  ->  7 matches
+```
+
+A grep that returns `NONE` is not evidence that work was not done unless the revision is the tip.
+**Run `git rev-parse --short HEAD` in the same command block as any `git grep`, `git show`, or
+`git ls-files` that is being used to decide whether something exists.**
+
+## Counting convention
+
+**Count collected node IDs, not `def` lines.** `@pytest.mark.parametrize` expands one definition into
+several tests, so `^def test_` undercounts. `pytest --collect-only -q | Measure-Object -Line` is the
+instrument. A `grep` for `def test_` is a way of finding *names*, never of counting *tests*.
