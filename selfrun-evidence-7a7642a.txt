@@ -1,0 +1,93 @@
+Stage 2 W8 final artifact evidence - 7a7642a
+=============================================
+
+Builder self-report. Not a gate verdict, and no gate target is named here.
+`latest` was not moved.
+
+Source
+------
+commit            7a7642a  "Add python-multipart: every browser form route 500s
+                           in the image without it"
+parent            1ed0336  "add /signup, /login and /split to complete the spec's routes"
+archive           git archive --format=zip 7a7642a stage-2
+archive sha256    cafa7cc076d109f2b8c5daeb08e74c14db4e4a1cd96c7fdbb65027c45458417d
+archive entries   36, no __pycache__, no .pyc, no tokens
+
+Image
+-----
+tag               pocketful-stage2:w8-final
+image id          sha256:9fe1f634a10045824232dc38daa7b0e34ed2fd36e11bd74965c98b3dec085723
+built from        the clean archive above, not from the working tree
+
+Scope completed this round
+--------------------------
+SPEC's route table lists six screens. Only three were served; /signup, /login
+and /split had no route, so their testids were unreachable.
+  - GET /signup, GET /login, GET /split
+  - POST /ui/signup, POST /ui/split
+  - split-preview and the submitted split both call operations.split_shares,
+    the Stage-1 A9 divmod rule extracted out of create_split, so the preview
+    cannot drift from the write. Verified by comparing the preview against the
+    parts the store actually recorded, not against a hand-written expectation.
+  - POST /auth/signup mints no access_token (Stage-1 logs in separately), so
+    /ui/signup redirects to /login rather than inventing a session.
+  - auth-error is emitted only when there is one, per SPEC's table. That made
+    the old _with_error string surgery on the element unsound, so the handlers
+    take the message as a parameter instead.
+
+Verification
+------------
+in-image suite        370 passed, 1 xfailed  (python-multipart present)
+host suite            370 passed, 1 xfailed
+Stage-1 harness       174 passed, 0 failed   (in-image, --network none)
+JSON byte identity    36 probes, byte-identical to f9826c5
+testid audit          79 checks across all six routes
+
+Offline, in-image, --network none, real HTTP
+  health                        200
+  GET /  /signup  /login  /split  200 text/html
+  POST /ui/signup               303 -> /login
+  POST /ui/login                303 -> /
+  signed-in home                200, current-handle = zoe
+  GET /requests                 200
+  GET /authorizations           200
+  split preview                 5.00 EUR / 5.00 EUR for two participants
+  external references          none (no http://, https://, //cdn, @import)
+  outbound socket from inside  OSError - container genuinely offline
+
+Export / import, in-image
+  GET /_test/export  200, keys: activity, authorization_ttl_seconds,
+    authorizations, balance_sum, balances, currency, exported_at, idempotency,
+    invariants, minor_units, requests, seeded_total, status, users
+  "tokens" key present     no
+  live bearer token in it  no
+  Authorization echoed     no
+  POST /_test/import       200, session survives (GET /me still 200)
+  import dropping a user   422 - refused rather than silently applied
+
+Two corrections worth recording
+-------------------------------
+1. The first image built from 1ed0336 failed collection with "Form data
+   requires python-multipart". requirements.txt never listed it; the host venv
+   happened to have it, so 370 tests passed in the source tree while every
+   form route would have returned 500 in the container. Found only by running
+   the suite inside the image. Fixed in 7a7642a.
+2. A token-free export probe that hit a non-existent /export path appeared to
+   pass, because a 404 error body contains no "tokens" key. The real routes are
+   /_test/export and /_test/import. The export numbers above come from the real
+   routes. The earlier W7 claim that a removed user gets 401 was NOT reproduced
+   by this probe - an import that drops a user is refused 422 instead - so that
+   claim is not restated here as verified.
+
+testid audit: 6 of 79 remain "missing" and all 6 are audit-script bugs, checked
+against SPEC rather than assumed:
+  SPEC 89   activity-list          audit checked the empty page, where
+                                   empty-activity replaces the list
+  SPEC 109  empty-requests         audit checked a nonempty page
+  SPEC 360  wallet-held            absent when held is zero, as SPEC requires
+  SPEC 361  authorize-handle       audit asked for authorize-to, which is not
+                                   a SPEC testid
+  SPEC 368-369 authorization-capture-{id}, -capture-amount-{id}
+                                   present only on an incoming open
+                                   authorisation; audit checked the creator's
+                                   page
