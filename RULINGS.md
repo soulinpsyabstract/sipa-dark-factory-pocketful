@@ -439,6 +439,32 @@ ab15423c   its own suite: 383 passed, inside the image, on --network none
 pair is R7's argument in full: a green suite is not a gate result, and a receipt is not a
 certification unless it is bound to the bytes by an instrument that varies across the boundary.
 
+### An image id is not a content pin either. Two ids, identical bytes.
+A second image was built during the gate. It is the proof of this section's point, not a rival to it:
+
+```
+w11-45bb71b  sha256:4318dc6a8e7e4a9d69737aaac053453025adc640c14a25e6cb091bd1af76633a   27 files
+w12-746634a  sha256:ccdd4d6cafd7321823f1c1ab6da4686f080246736085eab1c5e5843bcf2b2828   27 files
+identical 27   differing 0   only-in-either 0
+```
+**Two different image ids certifying byte-identical application files.** So the same rule that governs
+a blob hash, a commit id and an archive digest governs the image id: **an identifier that changes
+without the content changing certifies nothing.**
+
+**This closes the rebuild argument permanently.** The proposal was to rebuild "so the receipt names the
+current tip". That is **not achievable by rebuilding** — every rebuild mints a new image id for
+identical content, so a receipt keyed on the image id can never track a moving tip. The only value
+that tracks the tip is the **tree hash `2bacd3707fd84c3a84aad120f61002c63497e628`**, which has not
+moved across seven documentation commits. **Name the tree. Cite the id. Never promote an artifact
+for being newer.**
+
+`w12-746634a` is therefore a **duplicate, not a supersession**, and is kept rather than deleted: it is
+the evidence for this section, and deleting evidence to tidy a gate is the wrong instinct. It is not
+the gate target and must not be cited as one.
+
+Third appearance of the same rule: `bc4acc5`/`c43a7d0` (blob vs commit), a `store.py` blob matching
+four commits, an archive digest differing for identical trees, and now two image ids for one content.
+
 ### `sha256:ab15423c…` — PERMANENTLY EXCLUDED, on three independent grounds
 ```
 1  its stage-2 tree is 219213f6 == d793922 / 5384329 (byte-identical pair), predating §H and R3
