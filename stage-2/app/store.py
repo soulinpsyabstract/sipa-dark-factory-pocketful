@@ -142,6 +142,11 @@ class Store:
         self.activity: list[dict[str, Any]] = []
         self.idempotency: dict[tuple[str, str], dict[str, Any]] = {}
         self.tokens: dict[str, str] = {}
+        #: Per-payment visibility, for the D2 activity feed's ``data-visibility``
+        #: attribute only. Deliberately NOT part of any JSON projection and NOT
+        #: part of an export: ``/activity`` must stay byte-identical, so the
+        #: screens read the value from here instead of gaining a field.
+        self.payment_visibility: dict[str, str] = {}
         self.seeded_total: int = 0
         #: stage-2 fixture knobs. Defaulted per the spec (600 seconds, EUR, 2
         #: decimal places) and re-seeded by every reset/import.
@@ -485,6 +490,7 @@ class Store:
         self.activity = []
         self.idempotency = {}
         self.tokens = {}
+        self.payment_visibility = {}
         self.authorization_ttl_seconds = ttl
         self.currency = currency
         self.minor_units = minor_units

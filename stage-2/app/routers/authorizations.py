@@ -19,7 +19,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from ..dependencies import _user_public, get_current_user, store
+from ..dependencies import _user_public, get_current_user, get_ui_user, store
 from ..errors import AppError, not_found, validation_error
 from ..schemas import AuthorizationIn
 from ..ui import render_authorizations, wants_html
@@ -39,6 +39,7 @@ from ..store import (
 router = APIRouter()
 
 CurrentUser = Annotated[str, Depends(get_current_user)]
+UiUser = Annotated[str, Depends(get_ui_user)]
 
 #: ``limit``/``offset`` behave identically on ``GET /requests`` and
 #: ``GET /authorizations``. ``MAX_LIST_LIMIT`` is shared with operations.py.
@@ -206,7 +207,7 @@ def resolve_recipient(handle: Any, me: str) -> str:
 @router.get("/authorizations")
 def list_authorizations(
     request: Request,
-    me: CurrentUser,
+    me: UiUser,
     direction: str = Query(default="all"),
     status: str = Query(default="all"),
     limit: int | None = Query(default=None, ge=1, le=MAX_LIST_LIMIT),
@@ -279,6 +280,7 @@ def list_authorizations(
 
     payload = store.transaction(work)
     if wants_html(request.headers.get("accept")):
+        from .ui import new_nonce
         user = store.read(
             lambda: _user_public(
                 store.users[me],
@@ -288,7 +290,15 @@ def list_authorizations(
                 store.minor_units,
             )
         )
-        return HTMLResponse(render_authorizations(user=user, items=payload["items"]))
+        return HTMLResponse(
+            render_authorizations(
+                user=user,
+                items=payload["items"],
+                nonce=new_nonce(),
+                authorize_error=request.query_params.get("authorize_error", ""),
+                authorization_error=request.query_params.get("authorization_error", ""),
+            )
+        )
     return JSONResponse(status_code=200, content=payload)
 
 

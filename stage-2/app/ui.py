@@ -190,11 +190,12 @@ def _layout(title: str, body: str, handle: str | None, display: str | None) -> s
 
 
 def _field(label: str, testid: str, name: str, *, kind: str = "text",
-           placeholder: str = "") -> str:
+           placeholder: str = "", value: str = "") -> str:
     return (
         f"<label for=\"{esc(testid)}\">{esc(label)}</label>"
         f'<input id="{esc(testid)}" data-testid="{esc(testid)}" name="{esc(name)}" '
-        f'type="{kind}" placeholder="{esc(placeholder)}" autocomplete="off">'
+        f'type="{kind}" placeholder="{esc(placeholder)}" value="{esc(value)}" '
+        f'autocomplete="off">'
     )
 
 
@@ -255,10 +256,16 @@ def render_signed_out() -> str:
     return _layout("Sign in", body, None, None)
 
 
+def _hidden(name: str, value: str) -> str:
+    return f'<input type="hidden" name="{esc(name)}" value="{esc(value)}">'
+
+
 def render_home(*, user: dict, activity: list[dict], visibility: dict,
+                nonce: str = "",
                 pay_values: dict | None = None,
                 request_values: dict | None = None,
-                pay_error: str = "", request_error: str = "") -> str:
+                pay_error: str = "", pay_uncertain: str = "",
+                request_error: str = "") -> str:
     cur = user.get("currency", "EUR")
     mu = int(user.get("minor_units", 2))
     handle = str(user.get("handle", ""))
@@ -267,24 +274,39 @@ def render_home(*, user: dict, activity: list[dict], visibility: dict,
 
     pay_form = (
         '<h2>Pay someone</h2><form method="post" action="/ui/pay">'
-        + _field("Handle", "pay-handle", "to", placeholder="ada")
-        + _field("Amount", "pay-amount", "amount", placeholder="15.00")
-        + _field("Note (optional)", "pay-note", "note")
+        + _hidden("nonce", nonce)
+        + _field("Handle", "pay-handle", "to", placeholder="ada",
+                 value=str(pv.get("to", "")))
+        + _field("Amount", "pay-amount", "amount", placeholder="15.00",
+                 value=str(pv.get("amount", "")))
+        + _field("Note (optional)", "pay-note", "note", value=str(pv.get("note", "")))
         + '<label for="pay-visibility">Visibility</label>'
         + '<select id="pay-visibility" data-testid="pay-visibility" name="visibility">'
         f'<option value="private"{" selected" if pv.get("visibility") == "private" else ""}>Private</option>'
         f'<option value="public"{" selected" if pv.get("visibility") != "private" else ""}>Public</option>'
         "</select>"
-        + '<div><button type="submit" data-testid="pay-submit">Send payment</button></div>'
+        + '<div><button type="submit" data-testid="pay-submit">Send payment</button>'
+        # SPEC: a refresh that keeps the pay form. It is a GET on this same
+        # route, so the browser resends the pay fields as the query string and
+        # the re-render keeps them. Being a navigation, it cannot race itself,
+        # so "latest refresh wins" holds by construction: there is no second
+        # in-flight read to land late over a newer one.
+        '<button type="submit" data-testid="wallet-refresh" formmethod="get" '
+        'formaction="/">Refresh balance</button></div>'
         f'<p class="err" data-testid="pay-error" role="alert">{esc(pay_error)}</p>'
+        f'<p class="warn" data-testid="pay-uncertain" role="alert">{esc(pay_uncertain)}</p>'
         "</form>"
     )
 
     req_form = (
         '<h2>Request money</h2><form method="post" action="/ui/request">'
-        + _field("Handle", "request-handle", "to", placeholder="ada")
-        + _field("Amount", "request-amount", "amount", placeholder="15.00")
-        + _field("Note (optional)", "request-note", "note")
+        + _hidden("nonce", nonce)
+        + _field("Handle", "request-handle", "to", placeholder="ada",
+                 value=str(rv.get("to", "")))
+        + _field("Amount", "request-amount", "amount", placeholder="15.00",
+                 value=str(rv.get("amount", "")))
+        + _field("Note (optional)", "request-note", "note",
+                 value=str(rv.get("note", "")))
         + '<div><button type="submit" data-testid="request-submit">Send request</button></div>'
         f'<p class="err" data-testid="request-error" role="alert">{esc(request_error)}</p>'
         "</form>"
@@ -322,7 +344,8 @@ def render_home(*, user: dict, activity: list[dict], visibility: dict,
     return _layout("Wallet", body, handle, user.get("display_name"))
 
 
-def render_requests(*, user: dict, items: list[dict]) -> str:
+def render_requests(*, user: dict, items: list[dict], nonce: str = "",
+             request_error: str = "") -> str:
     cur = user.get("currency", "EUR")
     mu = int(user.get("minor_units", 2))
     incoming, outgoing = [], []
@@ -350,11 +373,11 @@ def render_requests(*, user: dict, items: list[dict]) -> str:
         forms = ""
         if status == "open" and req.get("direction") == "incoming":
             forms = (
-                f'<form id="f-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/pay"></form>'
-                f'<form id="g-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/decline"></form>'
+                f'<form id="f-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/pay">{_hidden("nonce", nonce)}</form>'
+                f'<form id="g-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/decline">{_hidden("nonce", nonce)}</form>'
             )
         if status == "open" and req.get("direction") == "outgoing":
-            forms = f'<form id="h-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/cancel"></form>'
+            forms = f'<form id="h-{esc(pid)}" method="post" action="/ui/requests/{esc(pid)}/cancel">{_hidden("nonce", nonce)}</form>'
         row = (
             f'<li data-testid="request-item-{esc(pid)}" data-status="{esc(status)}">'
             f'<div class="row-main">{amt} <span class="secondary">'
@@ -381,7 +404,7 @@ def render_requests(*, user: dict, items: list[dict]) -> str:
     body = (
         block("incoming-list", "Incoming requests", incoming, "Nothing incoming.")
         + block("outgoing-list", "Outgoing requests", outgoing, "Nothing outgoing.")
-        + '<p class="err" data-testid="request-error" role="alert"></p>'
+        + f'<p class="err" data-testid="request-error" role="alert">{esc(request_error)}</p>'
     )
     if not items:
         body = '<p class="empty" data-testid="empty-requests">No requests yet.</p>' + body
@@ -390,7 +413,8 @@ def render_requests(*, user: dict, items: list[dict]) -> str:
     )
 
 
-def render_authorizations(*, user: dict, items: list[dict]) -> str:
+def render_authorizations(*, user: dict, items: list[dict], nonce: str = "",
+                       authorize_error: str = "", authorization_error: str = "") -> str:
     cur = user.get("currency", "EUR")
     mu = int(user.get("minor_units", 2))
     rows = []
@@ -429,9 +453,9 @@ def render_authorizations(*, user: dict, items: list[dict]) -> str:
             )
         forms = ""
         if status == "open" and a.get("direction") == "incoming":
-            forms = f'<form id="c-{esc(aid)}" method="post" action="/ui/authorizations/{esc(aid)}/capture"></form>'
+            forms = f'<form id="c-{esc(aid)}" method="post" action="/ui/authorizations/{esc(aid)}/capture">{_hidden("nonce", nonce)}</form>'
         if status == "open" and a.get("direction") == "outgoing":
-            forms = f'<form id="v-{esc(aid)}" method="post" action="/ui/authorizations/{esc(aid)}/void"></form>'
+            forms = f'<form id="v-{esc(aid)}" method="post" action="/ui/authorizations/{esc(aid)}/void">{_hidden("nonce", nonce)}</form>'
         rows.append(
             f'<li data-testid="authorization-item-{esc(aid)}" data-status="{esc(status)}">'
             f'<div class="row-main">{"".join(parts)}</div>'
@@ -446,6 +470,7 @@ def render_authorizations(*, user: dict, items: list[dict]) -> str:
     form = (
         "<h2>Reserve money</h2>"
         + '<form method="post" action="/ui/authorizations">'
+        + _hidden("nonce", nonce)
         + _field("Handle", "authorize-handle", "to", placeholder="ada")
         + _field("Amount", "authorize-amount", "amount", placeholder="15.00")
         + _field("Note (optional)", "authorize-note", "note")
@@ -454,14 +479,14 @@ def render_authorizations(*, user: dict, items: list[dict]) -> str:
         '<option value="private">Private</option>'
         '<option value="public">Public</option></select>'
         '<div><button type="submit" data-testid="authorize-submit">Reserve</button></div>'
-        '<p class="err" data-testid="authorize-error" role="alert"></p></form>'
+        f'<p class="err" data-testid="authorize-error" role="alert">{esc(authorize_error)}</p></form>'
     )
     body = (
         f'<section class="card"><h1>Authorisations</h1>'
         f'{_wallet_numbers(user, headline_available=True)}</section>'
         f'<section class="card">{form}</section>'
         f'<section class="card"><h2>Your authorisations</h2>{lst}</section>'
-        '<p class="err" data-testid="authorization-error" role="alert"></p>'
+        f'<p class="err" data-testid="authorization-error" role="alert">{esc(authorization_error)}</p>'
     )
     return _layout(
         "Authorisations", body, str(user.get("handle", "")), user.get("display_name")

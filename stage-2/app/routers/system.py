@@ -32,22 +32,15 @@ def index(request: Request) -> Any:
     from ..ui import render_home, render_signed_out, wants_html
 
     if wants_html(request.headers.get("accept")):
-        from ..dependencies import _user_public, get_current_user
-        from ..errors import AppError
+        from .ui import new_nonce, ui_handle
 
-        handle = None
-        auth = request.headers.get("authorization") or ""
-        token = auth.split(None, 1)[1].strip() if len(auth.split(None, 1)) == 2 else ""
-        if token:
-            try:
-                handle = get_current_user(request, authorization=auth)
-            except AppError:
-                handle = None
-
+        handle = ui_handle(request)
         if handle is None:
             return HTMLResponse(render_signed_out())
 
-        def project() -> tuple[dict, list[dict]]:
+        from ..dependencies import _user_public
+
+        def project() -> tuple[dict, list[dict], dict]:
             public = _user_public(
                 store.users[handle],
                 store.balances,
@@ -57,11 +50,45 @@ def index(request: Request) -> Any:
             )
             rows = [dict(a) for a in store.activity if a["handle"] == handle]
             rows.sort(key=lambda a: a["id"], reverse=True)
-            return public, rows
+            # SPEC: activity-item-{id} carries data-visibility. /activity must
+            # not gain a field to do this, so the screens read the private
+            # per-payment map the store keeps for exactly this purpose. Same
+            # store.read, so the render still sees one consistent snapshot.
+            vis: dict[str, str] = {}
+            for row in rows:
+                pid = row.get("related_id") or row.get("id")
+                if pid:
+                    vis[pid] = str(store.payment_visibility.get(pid) or "public")
+            return public, rows, vis
 
-        user, rows = store.read(project)
+        user, rows, visibility = store.read(project)
+        q = request.query_params
         return HTMLResponse(
-            render_home(user=user, activity=rows, visibility={})
+            render_home(
+                user=user,
+                activity=rows,
+                visibility=visibility,
+                nonce=q.get("pay_nonce") or new_nonce(),
+                pay_values={
+                    # Flash names carry the outcome of a POST; the bare field
+                    # names carry wallet-refresh, a plain GET that must keep
+                    # whatever the pay form held. Either way the form comes
+                    # back filled.
+                    "to": q.get("pay_to") or q.get("to", ""),
+                    "amount": q.get("pay_amount") or q.get("amount", ""),
+                    "note": q.get("pay_note") or q.get("note", ""),
+                    "visibility": q.get("pay_visibility")
+                    or q.get("visibility", "private"),
+                },
+                request_values={
+                    "to": q.get("req_to", ""),
+                    "amount": q.get("req_amount", ""),
+                    "note": q.get("req_note", ""),
+                },
+                pay_error=q.get("pay_error", ""),
+                pay_uncertain=q.get("pay_uncertain", ""),
+                request_error=q.get("request_error", ""),
+            )
         )
 
     return {

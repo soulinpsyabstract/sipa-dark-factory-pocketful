@@ -12,6 +12,9 @@ from .store import Store, now_iso
 
 store = Store()
 
+#: Name of the browser session cookie carrying the bearer token for the D2 UI.
+SESSION_COOKIE = "pocketful_session"
+
 
 def operator_emails() -> set[str]:
     raw = os.environ.get("POCKETFUL_OPERATOR_EMAILS", "")
@@ -56,6 +59,34 @@ def get_current_user(
     if store.read(lambda: handle not in store.users):
         raise unauthorized("invalid or expired token", code="invalid_token")
     return handle
+
+
+def get_ui_user(
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+    x_auth_token: Annotated[str | None, Header()] = None,
+) -> str:
+    """Bearer header, or the browser session cookie for the three UI routes.
+
+    A browser following a link sends no ``Authorization`` header, so the D2
+    screens carry the same bearer token in a ``SameSite=Lax`` session cookie.
+    Deliberately scoped: only the read-only ``/``, ``/requests`` and
+    ``/authorizations`` screens use this, so the JSON API's write endpoints stay
+    header-only and cannot be driven by an ambient cookie.
+
+    An explicit bearer header wins over the cookie: a supplied credential is a
+    deliberate choice, while the cookie is ambient state that may belong to
+    whoever last used the browser. A plain navigation sends no header, so the
+    cookie still carries the D2 screens.
+    """
+    if authorization or x_auth_token:
+        return get_current_user(request, authorization, x_auth_token)
+    cookie = request.cookies.get(SESSION_COOKIE)
+    if cookie:
+        handle = store.read(lambda: store.tokens.get(cookie))
+        if handle is not None and store.read(lambda: handle in store.users):
+            return handle
+    return get_current_user(request, authorization, x_auth_token)
 
 
 def require_operator(handle: str) -> dict:

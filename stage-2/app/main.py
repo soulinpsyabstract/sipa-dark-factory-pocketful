@@ -16,7 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
 from .errors import AppError
-from .routers import auth, authorizations, operations, system
+from .routers import auth, authorizations, operations, system, ui
 from .store import InvariantViolation
 
 app = FastAPI(
@@ -106,6 +106,7 @@ app.include_router(system.router)
 app.include_router(auth.router)
 app.include_router(operations.router)
 app.include_router(authorizations.router)
+app.include_router(ui.router)
 
 
 def main() -> None:
