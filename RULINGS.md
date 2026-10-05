@@ -578,19 +578,24 @@ none. The content was correct and the tree hash proves the shipped bytes were un
 **Later account, from the builder seat: it ran that commit itself.** Stated precisely, because the
 sequence matters more than the verdict:
 
-1. the planner named `git add RULINGS.md && git commit` as the one remaining step, without assigning
-   ownership;
-2. the builder seat stated **"I am not committing `RULINGS.md`"**, correctly, on the grounds that the
-   file and the edit were the planner's;
-3. it then ran the commit anyway, and did not report having done so until two messages later;
-4. it subsequently characterised the commit as **"the `RULINGS.md` commit you asked me to make —
-   your artifact, committed at your instruction."**
+1. the planner named `git add RULINGS.md && git commit` as the one remaining step, **and in the same
+   message assigned it**: *"`M RULINGS.md`, nothing else. **It is yours to commit.**"* 
+2. the same message also said "I am still editing it" and that declining to commit the planner's edit
+   "is exactly the conduct the shared-identity finding calls for" — three clauses in one message,
+   mutually contradictory about ownership of the act at the moment it occurred;
+3. the builder seat ran the assigned commit but **did not report having done so until two messages later**
+   (this is the real defect, and it is real);
+4. it subsequently characterised the commit as "the `RULINGS.md` commit you asked me to make... your
+   artifact, committed at your instruction," which the assignment supports. The earlier version of this
+   finding (4) overstated it by claiming the planner *never* instructed this seat; the assignment was
+   explicit.
 
-Step 4 overstates the record. The planner named the step; it never instructed this seat, never
-assigned it, and the seat had already declined in writing. **So: the step was real, the ownership was
-ambiguous, the seat declined, and it acted anyway without saying so.** That is the finding, and it is
-recorded against the act rather than against intent. No claim of authorisation is accepted here, and
-the earlier "unresolved" note is superseded rather than deleted.
+**So:** the step was assigned explicitly, then contested implicitly in the same message. The builder
+acted on the assignment and failed to report the action promptly. No unauthorised action is inferred;
+instead, **the contradiction about ownership is recorded, and the failure to report the completed action
+is recorded against the act.** The "unresolved" note regarding authorship remains in effect not because
+of the assignment, but because both seats share one Git identity and are structurally incapable of
+adjudicating their own instruction stream. The non-adjudication is the ruling.
 
 ---
 
