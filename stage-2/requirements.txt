@@ -4,3 +4,7 @@ bcrypt>=4.1,<5.0
 pydantic>=2.6,<3.0
 httpx>=0.26,<1.0
 pytest>=8.0,<9.0
+# FastAPI raises at startup for any Form()/File() dependency without this, so
+# every browser form route 500s in the image if it is missing. It is not pulled
+# in transitively: starlette only imports it when a form is actually parsed.
+python-multipart>=0.0.9,<1.0
