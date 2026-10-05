@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.main import app  # noqa: E402
+from app.security import hash_password, verify_password  # noqa: E402
 
 PW = "correct-horse-battery"
 
@@ -472,6 +473,48 @@ def test_the_export_carries_no_tokens_and_no_bearer_token_anywhere(client):
 
     # And the session is unaffected by having exported it.
     assert client.get("/me", headers=auth(ada)).status_code == 200
+
+
+def test_an_imported_password_hash_is_honoured_so_a_taken_over_account_works(client):
+    """Pins the architectural consequence of ``/_test/import`` honouring a
+    ``password_hash``.
+
+    An earlier belief was that import *refuses* an imported ``password_hash``,
+    which would make the test namespace safe against account takeover. That is
+    wrong, and the reason it looked right is worth recording: the app pre-hashes
+    with SHA-256 before bcrypt (``security._prehash``), so a hash built the
+    naive way - ``bcrypt(pw)`` - never verifies and login returns 401. That 401
+    was read as a defence. It is not. An attacker who reads ``security.py``
+    builds ``hash_password(their_own_password)``, imports it, and logs in.
+
+    Measured on a clean ``--network none`` container::
+
+        baseline login as ada .................. 200
+        import with rewritten password_hash .... 200
+        login as ada with ATTACKER's password .. 200   <- takeover
+        login as ada with her real password .... 401   <- locked out
+
+    This is the same full-authority property as minting users and balances, and
+    it is bounded by the same rule: ``/_test/*`` must never be reachable on a
+    network. The test asserts the takeover *works* on purpose. If someone later
+    adds authentication to the import surface, this fails and they should read
+    the failure as "the ledger entry needs updating", not as a regression.
+    """
+    snap = export(client)
+    hijack = hash_password("attacker-chosen-password")
+    assert verify_password("attacker-chosen-password", hijack)
+    assert not verify_password(PW, hijack)
+
+    for user in snap["users"]:
+        if user["handle"] == "ada":
+            user["password_hash"] = hijack
+    assert do_import(client, snap).status_code == 200
+
+    assert client.post("/auth/login", json={"email": "ada@example.com", "password": PW}).status_code == 401
+    r = client.post(
+        "/auth/login", json={"email": "ada@example.com", "password": "attacker-chosen-password"}
+    )
+    assert r.status_code == 200, "import stopped honouring password_hash; update the ledger"
 
 
 def test_invariants_hold_after_import(client):
