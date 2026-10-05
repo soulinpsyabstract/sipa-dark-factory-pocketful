@@ -384,7 +384,9 @@ class Store:
     # fixture handling (reset / import share this)
     # ------------------------------------------------------------------
 
-    def _install_fixture(self, fixture: dict[str, Any]) -> None:
+    def _install_fixture(
+        self, fixture: dict[str, Any], *, preserve_live_holds: bool = False
+    ) -> None:
         """Replace the entire world. Atomic: callers hold the lock."""
         raw_users = fixture.get("users", [])
         if not isinstance(raw_users, list):
@@ -476,6 +478,7 @@ class Store:
         authorizations = self._parse_authorization_records(
             fixture.get("authorizations") or [], balances
         )
+        prior_authorizations = {k: dict(v) for k, v in self.authorizations.items()}
 
         ttl = self._parse_authorization_ttl(fixture.get("authorization_ttl_seconds"))
         currency, minor_units = self._parse_display_metadata(
@@ -487,6 +490,25 @@ class Store:
         self.seeded_total = seeded_total
         self.requests = {}
         self.authorizations = authorizations
+        if preserve_live_holds and not (fixture.get("authorizations") or []):
+            # A payload with no `authorizations` has not asked to release any
+            # hold - it either predates the concept (a stage-1 export) or simply
+            # omits the field. Treating that silence as "release everything"
+            # hands reserved funds straight back to the payer while the
+            # recipient still holds a capture right against them, and the
+            # importer is not authenticated. Measured on 42edbf7: an
+            # unauthenticated stage-1-shaped import took a live hold from 800 to
+            # 0 and pushed available from 1200 to 2000.
+            #
+            # So carry the live holds across for handles that survive. A hold
+            # whose payer or recipient this import removes cannot be kept, and
+            # drops with them.
+            self.authorizations = {
+                auth_id: record
+                for auth_id, record in prior_authorizations.items()
+                if record.get("from_handle") in users
+                and record.get("to_handle") in users
+            }
         self.activity = []
         self.idempotency = {}
         self.tokens = {}
@@ -842,7 +864,11 @@ class Store:
                 return self._install_full_export(payload, saved.get("tokens") or {})
 
             if "users" in payload or "balances" in payload or "seeded_total" in payload or "total" in payload:
-                self._install_fixture(payload)
+                # preserve_live_holds: a bare fixture that says nothing about
+                # authorizations must not release the holds that are live right
+                # now. It still clears requests/activity/idempotency, exactly as
+                # on /_test/reset.
+                self._install_fixture(payload, preserve_live_holds=True)
                 return self._export()
         except Exception:
             self._restore_state(saved)
@@ -867,7 +893,8 @@ class Store:
                 "users": payload.get("users", []),
                 "balances": payload.get("balances", {}),
                 "seeded_total": payload.get("seeded_total", payload.get("total")),
-            }
+            },
+            preserve_live_holds=True,
         )
 
         requests_payload = payload.get("requests") or []
@@ -944,35 +971,43 @@ class Store:
         # Stage-2 holds must survive the round trip: an exported authorization
         # that was dropped here would silently un-reserve its money and let the
         # payer spend the same funds twice.
-        authorizations_payload = payload.get("authorizations") or []
-        if not isinstance(authorizations_payload, list):
-            raise validation_error("export 'authorizations' must be a list")
-        restored_auth: dict[str, dict[str, Any]] = {}
-        for record in authorizations_payload:
-            if not isinstance(record, dict):
-                raise validation_error("each exported authorization must be an object")
-            record = dict(record)
-            auth_id = record.get("id") or record.get("authorization_id")
-            if not auth_id or not isinstance(auth_id, str):
-                raise validation_error("each exported authorization needs an 'id'")
-            if record.get("status") not in AUTHORIZATION_STATUSES:
-                raise validation_error(
-                    f"exported authorization {auth_id!r} has unknown status {record.get('status')!r}"
-                )
-            for role in ("from", "to"):
-                handle = record.get(role) or record.get(f"{role}_handle")
-                if not isinstance(handle, str) or handle not in self.users:
+        #
+        # A payload that omits `authorizations` entirely has not asked to release
+        # anything - it predates the concept. `preserve_live_holds` above already
+        # carried the live holds across, so leave them be rather than collapsing
+        # "absent" into "empty" the way `payload.get(...) or []` would. An
+        # explicit empty list is still honoured as an empty snapshot.
+        if "authorizations" in payload:
+            authorizations_payload = payload["authorizations"] or []
+            if not isinstance(authorizations_payload, list):
+                raise validation_error("export 'authorizations' must be a list")
+            restored_auth: dict[str, dict[str, Any]] = {}
+            for record in authorizations_payload:
+                if not isinstance(record, dict):
+                    raise validation_error("each exported authorization must be an object")
+                record = dict(record)
+                auth_id = record.get("id") or record.get("authorization_id")
+                if not auth_id or not isinstance(auth_id, str):
+                    raise validation_error("each exported authorization needs an 'id'")
+                if record.get("status") not in AUTHORIZATION_STATUSES:
                     raise validation_error(
-                        f"exported authorization {auth_id!r} references unknown user {handle!r}",
-                        code="unknown_user",
+                        f"exported authorization {auth_id!r} has unknown status {record.get('status')!r}"
                     )
-                record[role] = handle
-                record[f"{role}_handle"] = handle
-            record["id"] = auth_id
-            record.setdefault("captured_amount", 0)
-            record.setdefault("payment_ids", [])
-            restored_auth[auth_id] = record
-        self.authorizations = restored_auth
+                for role in ("from", "to"):
+                    handle = record.get(role) or record.get(f"{role}_handle")
+                    if not isinstance(handle, str) or handle not in self.users:
+                        raise validation_error(
+                            f"exported authorization {auth_id!r} references unknown user {handle!r}",
+                            code="unknown_user",
+                        )
+                    record[role] = handle
+                    record[f"{role}_handle"] = handle
+                record["id"] = auth_id
+                record.setdefault("captured_amount", 0)
+                record.setdefault("payment_ids", [])
+                restored_auth[auth_id] = record
+            self.authorizations = restored_auth
+            self._sync_authorization_ids()
 
         # Sessions are preserved server-side, never *required* to travel.
         #
