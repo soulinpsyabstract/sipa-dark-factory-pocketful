@@ -195,6 +195,37 @@ If it returns the same value on both sides it certifies nothing, and the more lo
 likely that is. Absence of a flag is a usable discriminator here; presence of the dangerous statement
 is not.
 
+### Sharper form: the discriminator is on a different LINE from the danger, so no single-line check works.
+`password_hash = existing_hash` occurs **exactly once in each build — identical text, opposite meaning**:
+
+```
+VULNERABLE ab15423c                     FIXED 4318dc6a
+474  existing_hash = entry.get(...)     638  existing_hash = entry.get(...)
+475  if is_bcrypt_hash(existing_hash):  639      if not honour_password_hash:
+476      password_hash = existing_hash  640          password_hash = self._credential_from_import(...)
+                                         641      elif is_bcrypt_hash(existing_hash):
+                                             642          password_hash = existing_hash
+```
+```
+grep 'password_hash = existing_hash'   vulnerable 1   fixed 1   IDENTICAL - cannot discriminate
+grep 'honour_password_hash'             vulnerable 0   fixed 5   discriminates
+grep '_credential_from_import'          vulnerable 0   fixed 4   discriminates
+```
+**The one discriminating token — `elif` instead of `if` — sits on the preceding line, and carries none
+of the alarming text.** So:
+
+- grep the **dangerous statement** -> false positive on a sound artifact, in both builds;
+- grep the **remedy keyword** -> **nothing in the vulnerable build, which reads as "already fixed."**
+
+**That second case is worse than a false positive.** Absence of the remedy is read as presence of
+safety, so the check returns the *opposite* of the truth and looks correct. A single-line audit cannot
+work here even when the line is the right one to look at.
+
+**Generalised: a check must reach across the construct that carries the behaviour, not just the
+statement that names it.** Where a semantic difference is expressed by one token in a branch shape,
+the discriminator is the branch shape — `elif` vs `if`, `is not None` vs truthiness, `0 <` vs `<=` —
+never the payload line.
+
 Measured on `--network none`, before and after:
 
 | payload | before | after |
@@ -389,6 +420,12 @@ files under stage-2 differing 45bb71b..7f54821:  0
 ```
 **No rebuild was spent on `45bb71b` -> `7f54821`, and none should be.** A rebuild would mint a new
 image id for byte-identical content: a receipt that reads more literally while evidencing less.
+
+> **CORRECTION TO A CIRCULATED CLAIM.** An earlier message to the builder said "after that commit
+> `309cb8b` becomes the tip." **It does not, and cannot: `309cb8b` is five commits behind and is frozen
+> history.** The equivalence argument never depended on it — it rests on the tree hash above. The
+> sentence is corrected here because it was wrong in chat, and a reader copies the sha and not the
+> argument. Nothing downstream inherited it; the gate target was never `309cb8b`.
 
 ### Binding, by blob, file by file
 ```
