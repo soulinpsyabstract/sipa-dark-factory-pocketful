@@ -200,19 +200,90 @@ def test_an_old_export_carrying_tokens_cannot_wipe_sessions(client):
 
 
 @pytest.mark.parametrize(
-    "junk", [7, "not-a-list", ["not-an-object"], [{"handle": "ada"}], [{"token": "t"}]]
+    "legacy",
+    [
+        # The shape the token-export era actually wrote, verified against the
+        # emitting commits (ca71a9d, 6f07f4e, 1601616^).
+        [{"token": "stale-ada", "handle": "ada"}],
+        [{"token": "stale-ada", "handle": "ada"}, {"token": "stale-bob", "handle": "bob"}],
+        # And the same information as a mapping.
+        {"ada": "stale-ada"},
+        {},
+    ],
 )
-def test_a_structurally_broken_tokens_key_is_ignored_not_refused(client, junk):
-    """A broken key is discarded like any other.
+def test_a_well_formed_legacy_tokens_key_imports_and_is_discarded(client, legacy):
+    """Half one of R2: a structurally valid legacy key restores, then does nothing.
 
-    Refusing it would 422 the whole import over a field with no effect, which
-    would make every pre-G export unimportable for no benefit.
+    Refusing these would 422 the whole import over a field with no effect and
+    make every genuinely legacy export unimportable, which is the opposite of
+    what the compat rule is for.
     """
     ada = auth(login(client, "ada"))
     payload = export(client)
-    payload["tokens"] = junk
+    payload["tokens"] = legacy
     r = do_import(client, payload)
     assert r.status_code == 200, r.text
+    # The live session survives, and nothing from the payload authenticates.
+    assert client.get("/me", headers=ada).status_code == 200
+    for entry in legacy if isinstance(legacy, list) else [
+        {"token": v} for v in legacy.values()
+    ]:
+        assert client.get("/me", headers=auth(entry["token"])).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "junk",
+    [
+        7,
+        "not-a-list",
+        None,
+        True,
+        ["not-an-object"],
+        [{"handle": "ada"}],
+        [{"token": "t"}],
+        [{"token": 1, "handle": "ada"}],
+        [{"token": "t", "handle": 2}],
+        {"ada": 1},
+        {"ada": None},
+        # A non-string mapping *key* is unreachable over JSON: `{"1": "t"}` is
+        # what a caller sending `{1: "t"}` produces, and that is a well-formed
+        # mapping, accepted by the leg above. JSON has only string keys, so the
+        # validator cannot reject one and the test must not pretend to.
+    ],
+    ids=[
+        "int",
+        "string",
+        "null",
+        "bool",
+        "list-of-non-objects",
+        "entry-missing-token",
+        "entry-missing-handle",
+        "entry-token-not-string",
+        "entry-handle-not-string",
+        "mapping-value-not-string",
+        "mapping-value-null",
+    ],
+)
+def test_a_structurally_malformed_tokens_key_is_refused(client, junk):
+    """Half two of R2: a structurally impossible key is 422, not swallowed.
+
+    ``tokens`` is in no stage-1 or stage-2 contract, so no build ever emitted
+    these. Importing them anyway silently swallows corruption in a restore path.
+    """
+    payload = export(client)
+    payload["tokens"] = junk
+    r = do_import(client, payload)
+    assert r.status_code == 422, f"{junk!r} should be refused, got {r.status_code}: {r.text}"
+
+
+def test_refusing_a_malformed_tokens_key_changes_nothing(client):
+    """A 422 on a junk key must not cost the caller their world."""
+    ada = auth(login(client, "ada"))
+    before = _state(client)
+    payload = export(client)
+    payload["tokens"] = "garbage"
+    assert do_import(client, payload).status_code == 422
+    assert _state(client) == before
     assert client.get("/me", headers=ada).status_code == 200
 
 

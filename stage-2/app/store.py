@@ -171,6 +171,107 @@ def validate_imported_amount(
     return value
 
 
+def validate_imported_captured(value: Any, *, field: str, owner: str) -> int:
+    """Validate an authorization's *derived* money field on the import path.
+
+    ``captured_amount`` and ``remaining_amount`` sit beside ``amount`` on an
+    exported authorization but were assigned straight from the payload. A
+    negative capture left a record that was ``status: open``, reserved the full
+    ``amount`` in ``held``, and reported every invariant as true; a string
+    reached ``remaining_amount`` and surfaced later as a comparison error rather
+    than a rejection.
+
+    Both are non-negative by construction - ``_remaining`` at store.py:118
+    clamps a negative capture to zero - so the bound is ``0 <= value <=
+    MAX_AMOUNT`` and zero is legal, unlike ``amount``. The rule is deliberately
+    the same shape as ``validate_imported_amount`` with the lower bound moved:
+    a captured amount of zero is a legitimate authorization nobody has drawn on.
+    """
+    if isinstance(value, bool) or isinstance(value, str) or not isinstance(value, int):
+        raise validation_error(
+            f"{field} on {owner} must be an integer number of minor units, "
+            f"not {type(value).__name__}",
+            code="validation_failed",
+        )
+    if value < 0:
+        raise validation_error(
+            f"{field} on {owner} must not be negative, got {value}",
+            code="validation_failed",
+        )
+    if value > MAX_AMOUNT:
+        raise validation_error(
+            f"{field} on {owner} must be at most {MAX_AMOUNT}, got {value}",
+            code="validation_failed",
+        )
+    return value
+
+
+def _reject_malformed_tokens(payload: dict[str, Any]) -> None:
+    """Refuse a ``tokens`` key that is not a handle -> token mapping.
+
+    Two rules, because one era produced this key legitimately and a restore
+    path should not swallow garbage:
+
+    - **Well-formed, stale entries.** Accepted and discarded. The token-export
+      era wrote ``tokens`` as a *list of objects* -
+      ``[{"token": t, "handle": h}, ...]`` - and that is the only shape this
+      product ever emitted. A handle -> token mapping is also accepted, since
+      it is the same information in the obvious form. Verified against the
+      emitting commits rather than from memory::
+
+          2b26778  no tokens key in export
+          ca71a9d  "tokens": [{"token": token, "handle": handle} ...]
+          6f07f4e  "tokens": [{"token": token, "handle": handle} ...]
+          1601616^ "tokens": [{"token": token, "handle": handle} ...]
+          1601616  key removed from the export entirely
+
+      Refusing the list form would refuse every genuinely legacy file, which is
+      the opposite of what the compat rule is for.
+    - **Structurally malformed** (string, int, ``None``, a list of non-objects,
+      objects missing ``token`` or ``handle``, a mapping with non-string keys or
+      values). Refused with ``422``. ``tokens`` is in no stage-1 or stage-2
+      contract, so no build ever produced such a payload; importing it silently
+      swallows corruption in a restore path, and a restore that half-succeeds on
+      a structurally impossible file is worse than one that stops.
+
+    Either way the key never authenticates anything. That is settled separately
+    at ``42edbf7`` and is not what this guard enforces.
+    """
+    if "tokens" not in payload:
+        return
+    tokens = payload["tokens"]
+    detail = f"not {type(tokens).__name__}"
+
+    if isinstance(tokens, list):
+        # The only shape this product ever emitted.
+        for entry in tokens:
+            if not isinstance(entry, dict):
+                detail = f"list entry {entry!r} is not an object"
+                break
+            if not isinstance(entry.get("token"), str) or not isinstance(
+                entry.get("handle"), str
+            ):
+                detail = f"list entry {entry!r} needs string 'token' and 'handle'"
+                break
+        else:
+            return
+    elif isinstance(tokens, dict):
+        # The same information in mapping form: handle -> token.
+        for handle, token in tokens.items():
+            if not isinstance(handle, str) or not isinstance(token, str):
+                detail = f"mapping entry {handle!r}: {token!r} is not handle -> token strings"
+                break
+        else:
+            return
+    else:
+        detail = f"not a list or object ({type(tokens).__name__})"
+
+    raise validation_error(
+        f"tokens is structurally malformed: {detail}",
+        code="validation_failed",
+    )
+
+
 def is_bcrypt_hash(value: Any) -> bool:
     return isinstance(value, str) and value.startswith(_BCRYPT_PREFIXES)
 
@@ -887,6 +988,8 @@ class Store:
         if not isinstance(payload, dict):
             raise validation_error("import payload must be a JSON object")
 
+        _reject_malformed_tokens(payload)
+
         is_full_export = "requests" in payload or "activity" in payload or "idempotency" in payload
         saved = self._capture_state()
         try:
@@ -1045,6 +1148,20 @@ class Store:
                 record[f"{role}_handle"] = handle
             record["id"] = auth_id
             record.setdefault("captured_amount", 0)
+            # `captured_amount` and `remaining_amount` are money fields on the
+            # import path too. Zero is legal here - unlike `amount` - because an
+            # authorization nobody has drawn on captures nothing.
+            validate_imported_captured(
+                record["captured_amount"],
+                field="authorization captured_amount",
+                owner=f"exported authorization {auth_id!r}",
+            )
+            if record.get("remaining_amount") is not None:
+                validate_imported_captured(
+                    record["remaining_amount"],
+                    field="authorization remaining_amount",
+                    owner=f"exported authorization {auth_id!r}",
+                )
             record.setdefault("payment_ids", [])
             restored_auth[auth_id] = record
         self.authorizations = restored_auth
