@@ -862,6 +862,7 @@ class Store:
         captured by ``_import``. ``_install_fixture`` clears it, so it has to be
         handed in rather than read back off ``self``.
         """
+        prior_handles = frozenset(self.users)
         self._install_fixture(
             {
                 "users": payload.get("users", []),
@@ -1001,11 +1002,17 @@ class Store:
             # export stopped carrying tokens. Honour it so an
             # already-generated file still imports.
             #
-            # The one thing that is *not* honoured is a token naming a handle
-            # this import removes: honouring it would leave a deprovisioned user
-            # authenticated. Such tokens are dropped rather than refused, so a
-            # legacy file still imports in exactly the case where it removes
-            # someone, instead of failing closed on a 422.
+            # Two different bad things can show up here, and they need
+            # different answers:
+            #
+            # * A token naming a handle *this import removes*. Honouring it
+            #   would leave a deprovisioned user authenticated, so it is
+            #   dropped. It is dropped rather than refused because refusing
+            #   would 422 the whole import, and the point of a deprovisioning
+            #   import is that it succeeds.
+            # * A token naming a handle that never existed here at all. No
+            #   reading of that payload is coherent, so it is a malformed
+            #   payload and is refused outright.
             if not isinstance(raw_tokens, list):
                 raise validation_error("export 'tokens' must be a list")
             restored: dict[str, str] = {}
@@ -1018,7 +1025,12 @@ class Store:
                 if not isinstance(handle, str) or not handle:
                     raise validation_error("each exported token needs a 'handle'")
                 if handle not in self.users:
-                    continue
+                    if handle in prior_handles:
+                        continue
+                    raise validation_error(
+                        f"exported token references unknown user {handle!r}",
+                        code="unknown_user",
+                    )
                 restored[token] = handle
             self.tokens = restored
 

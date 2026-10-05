@@ -208,6 +208,53 @@ def test_a_malformed_tokens_key_is_refused(client):
     assert r.status_code == 422, r.text
 
 
+def test_a_legacy_token_naming_a_handle_that_never_existed_is_refused(client):
+    """A token for a handle the snapshot never had is a malformed payload.
+
+    Distinct from the deprovisioning case above, which must still import: there
+    the handle used to exist here and this import removes it, so dropping the
+    token is right. Here no reading of the payload is coherent.
+    """
+    payload = export(client)
+    payload["tokens"] = [{"token": "t_ghost", "handle": "nobody"}]
+    r = do_import(client, payload)
+    assert r.status_code == 422, r.text
+    assert r.json()["code"] == "unknown_user", r.text
+
+
+def test_the_ghost_token_is_refused_but_a_deprovisioning_import_still_lands(client):
+    """The two legs together, because they collide on nearly the same input.
+
+    Both payloads keep the export's ``requests`` / ``activity`` / ``idempotency``
+    keys: a payload without them is a bare fixture and takes a different branch,
+    so it would never reach the tokens handling at all and would make this test
+    pass for the wrong reason.
+    """
+    ada = auth(login(client, "ada"))
+    full = export(client)
+
+    deprovisioning = dict(full)
+    deprovisioning["users"] = []
+    deprovisioning["balances"] = {}
+    deprovisioning["balance_sum"] = 0
+    deprovisioning["seeded_total"] = 0
+    deprovisioning["activity"] = []
+    deprovisioning["requests"] = []
+    deprovisioning["idempotency"] = []
+    deprovisioning["tokens"] = [{"token": "t_ada", "handle": "ada"}]
+
+    r = do_import(client, deprovisioning)
+    assert r.status_code == 200, f"deprovisioning import must land, got {r.text}"
+    assert client.get("/me", headers=ada).status_code == 401, (
+        "a deprovisioning import left the removed user authenticated"
+    )
+
+    ghost = dict(deprovisioning)
+    ghost["tokens"] = [{"token": "t_ghost", "handle": "nobody"}]
+    r2 = do_import(client, ghost)
+    assert r2.status_code == 422, r2.text
+
+
 # ----------------------------------------------------------------------
 # holds survive the upgrade
 # ----------------------------------------------------------------------
