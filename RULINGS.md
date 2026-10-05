@@ -36,12 +36,45 @@ must differ:
 | `[]` | removed | hold dropped (deprovisioned) |
 | key present | present | hold preserved |
 
-Red proof, each break injected at the real dispatch point in `store.py`:
+### Red proofs — and the injection point is part of the proof
 
-| injected wrong rule | caught by |
+**A red proof that does not name where the break goes is not reproducible, and the obvious place is
+vacuous.** Three attempts were needed to get a real failure here, and the two that failed silently are
+the ones a reader would pick first:
+
+| injection | result |
 | --- | --- |
-| absent key preserves live holds (`cb18e6e`) | `..._stage1_export_leaves_no_holds_behind` → `(2000, 800, 1200)` != `(2000, 0, 2000)` |
-| explicit `[]` preserves live holds (blanket refusal) | `..._deprovisioning_fixture_drops_the_removed_payers_hold` → `(2000, 800, 1200)` != `(2000, 0, 2000)` |
+| `store.py:1183` — `payload.get("authorizations") or []` | **2 passed — VACUOUS, proves nothing** |
+| `store.py:694` — inside `_install_fixture` | 1 failed, 1 passed — real |
+| stash live holds before `_install_fixture`, restore at `1183` | **1 failed — real** |
+
+**Why `1183` is dead for this.** It is the line that reads the payload, and it *is* where R1's rule
+lives textually — but it is inside `_install_full_export` and runs **before** the two assignments that
+overwrite it:
+
+```
+_install_full_export:1183   authorizations_payload = payload.get("authorizations") or []
+  -> _install_fixture:694   authorizations = self._parse_authorization_records(...)
+  -> _install_fixture:707   self.authorizations = authorizations        <- clobbers the break
+  -> _install_full_export:1233  self.authorizations = restored_auth   <- clobbers it again
+```
+Anything written to `self.authorizations` at `1183` is discarded twice before the assertion runs, so
+the suite stays green and **the proof looks like it passed.** This is the absence-instrument hazard
+below, aimed at this ledger's own table.
+
+**`694` is the real dispatch point.** Inject the wrong rule where the records are *parsed*, and each
+break yields a distinct signature, which is what makes them independent controls rather than two views
+of one assertion:
+
+| injected wrong rule | injection point | caught by | signature |
+| --- | --- | --- | --- |
+| absent key preserves live holds (`cb18e6e`) | `694` | `..._stage1_export_leaves_no_holds_behind` | `assert (2000, 800, 1200) == (2000, 0, 2000)` |
+| explicit `[]` preserves live holds (blanket refusal) | `694` | `..._deprovisioning_fixture_drops_the_removed_payers_hold` | `assert (2000, 1600, 400) == (2000, 800, 1200)` |
+
+2 failed, 76 deselected when both are injected together.
+
+**Rule: every red proof records the file, the line, and the resulting signature. A green result from
+an unnamed injection point is not evidence.**
 
 Without the first break the old stage-1 test passed for the wrong reason; without the second the whole
 suite passed with a blanket refusal in place. Neither defect was visible before these pins.
@@ -62,6 +95,26 @@ The emitting commits wrote `tokens` as a **list of objects**, not a mapping:
 | `1601616` | key removed from the export entirely |
 
 **Refusing `list` would have refused every genuinely legacy file this rule exists to admit.**
+
+### The refusal predates this ruling. It is not an invented rule.
+A room message claimed that refusing a malformed `tokens` key was wrong, on the grounds that
+"refusing it would make every pre-§G export unimportable over a field nobody reads". **The premise is
+false**, and the emitter history above shows it: the only shapes any build ever wrote are a well-formed
+list or no key at all, both admitted `200`.
+
+```
+git grep -n 'isinstance.*tokens.*list' ca71a9d -- stage-2/app
+  ca71a9d:stage-2/app/store.py:963:  if not isinstance(tokens_payload, list):
+
+git grep -n 'isinstance.*tokens.*list' 1601616 -- stage-2/app
+  no match  --  the key and its validation were removed together
+```
+`ca71a9d` already refused a non-list, **before R2 existed and before this dispute began.** `1601616`
+removed the key and the validation in the same change. `0f73ecb` restored the refusal under the
+corrected rule below. So `422` is not a new constraint imposed on legacy data — it is the original
+behaviour, and dropping it would be the change.
+
+**Ruling: structurally malformed is `422`. Settled, and not revisitable from an undated message.**
 
 Accepted and discarded, inert (`200`, token then `401` on use):
 - `[{"token": ..., "handle": ...}, ...]` — the legacy list of objects
@@ -93,6 +146,54 @@ Two halves, both pinned:
 
 - injected `hash_password(attacker)` → attacker `401`, owner `200` (inert, not destructive);
 - unmodified export → every seeded login still `200` (it is a *restore* rule, not *disable login*).
+
+**Red proof, with its injection point.** The break is flipping the credential rule at the two import
+call sites, **never at `/_test/reset`** — the reset path is *supposed* to honour the payload, so
+breaking it proves nothing about import:
+
+| injection | line | result |
+| --- | --- | --- |
+| `_import` honours the payload digest | `store.py:1065` `honour_password_hash=False` -> `True` | **1 failed, 8 passed** |
+| `_install_full_export` honours the payload digest | `store.py:1091` `honour_password_hash=False` -> `True` | same signature |
+| `/_test/reset` honours the payload digest | *nothing to break — this is the ruling* | n/a |
+
+Signature: `assert 200 == 401`, on the message *"import installed a password_hash from the payload;
+`/_test/import` can take over any account."* The hold break does not disturb the credential pin —
+different subsystem — so the two are independent controls.
+
+### The takeover line is textually identical in the vulnerable and the fixed build. `if` vs `elif` is
+### the whole fix, and no grep for that line can tell them apart.
+
+Two artifacts, same `store.py` logic, extracted from the images themselves:
+
+```
+sha256:ab15423c…  (vulnerable)          sha256:4318dc6a…  (fixed)
+474  existing_hash = entry.get(...)     638  existing_hash = entry.get(...)
+475  if is_bcrypt_hash(existing_hash):  639  if not honour_password_hash:
+476      password_hash = existing_hash  640      password_hash = self._credential_from_import(...)
+                                         641  elif is_bcrypt_hash(existing_hash):
+                                             642      password_hash = existing_hash
+```
+**Line 476 and line 642 are the same statement.** The only difference in the entire credential path is
+one keyword, `elif` instead of `if`, because a new branch was inserted above it. So:
+
+- `grep 'password_hash = existing_hash'` **hits both builds.** It cannot discriminate them.
+- `honour_password_hash` present/absent **does** discriminate: **5** in the fixed image, **0** in the
+  vulnerable one, and `_credential_from_import` present only in the fixed one.
+
+**This is the third instance of one error class, and it is the sharpest: a fingerprint measured at too
+fine a granularity is constant across the boundary it is supposed to police.**
+
+| check | granularity | result |
+| --- | --- | --- |
+| `_fingerprint` call count, `1f94fcb` vs `main` | call count, `6` vs `6` | passed a broken fork |
+| `store.py` blob, `ab15423c` vs four commits | single file | 4-way ambiguous, identified nothing |
+| `password_hash = existing_hash`, fixed vs vulnerable | one source line | **identical in both** |
+
+**Rule: before trusting a check to police a boundary, confirm it actually VARIES across that boundary.**
+If it returns the same value on both sides it certifies nothing, and the more local the check the more
+likely that is. Absence of a flag is a usable discriminator here; presence of the dangerous statement
+is not.
 
 Measured on `--network none`, before and after:
 
@@ -180,7 +281,26 @@ negotiation failure.
 ## R6 — Tokens are never honoured. SETTLED (`42edbf7`).
 Exports omit `tokens`. Imports use only the saved live session table scoped to surviving handles.
 Incoming `tokens` never authenticates and never de-authenticates. Deprecated accounts are signed out.
-`G1`–`G5` green. See R2 for the malformed case.
+See R2 for the malformed case.
+
+### The `G1`–`G5` labels are retired. They were never test names.
+An earlier wording of this ruling read "`G1`–`G5` green". **Those were audit leg-labels written in
+place of test identifiers, and no test by that name has ever existed.** The claim has been replaced
+with the tests that actually pin each behaviour, so the ruling no longer depends on reconstructing
+what the labels meant:
+
+| behaviour | pinned by |
+| --- | --- |
+| export carries no tokens | `test_the_export_carries_no_tokens_and_no_bearer_token_anywhere` |
+| payload token cannot mint a session | `test_a_payload_tokens_key_cannot_mint_a_session_for_another_user` |
+| payload token cannot wipe live sessions | `test_an_old_export_carrying_tokens_cannot_wipe_sessions` |
+| legacy well-formed forms admitted, inert | `test_a_well_formed_legacy_tokens_key_imports_and_is_discarded` |
+| malformed forms refused, atomically | `test_a_structurally_malformed_tokens_key_is_refused`, `test_refusing_a_malformed_tokens_key_changes_nothing` |
+
+Verified by name against the tree. **All five exist; none is a renamed or reconstructed claim.** The
+substitution was the same error as R4's "measured" — an identifier-shaped token standing where a
+verifiable name was required — and it survived two §6 sweeps because it was phrased as a pass/fail
+claim, so no citation pointed at it. See the identity-token finding below.
 
 ## R7 — Gate provenance: branch and tag, never the commit message. SETTLED.
 Certification does not transfer across commits. **Re-run every differential at the final tip from that
@@ -189,6 +309,28 @@ tip's own commit.** The `0afd2be` receipt does not certify `e8296fc`.
 `1f94fcb` / `w7-token-only` is **not gate-eligible**. It is contained by no other branch and is the tip
 of nothing. It exists solely as evidence that this divergence happened, and it must survive to the next
 reader — so it is **documented here rather than deleted.**
+
+### The instrument for "did the shipped code change?" is the tree hash, not the commit id.
+A ruling is certified by the bytes it was run against, so the question is never "which commit" but
+"which tree". Demonstrated where it actually bit:
+
+```
+0f73ecb:stage-2   2e76144b59577a12c21b284c888a1a2fd5b4421a
+37e73f5:stage-2   2e76144b59577a12c21b284c888a1a2fd5b4421a   identical
+45bb71b:stage-2   2bacd3707fd84c3a84aad120f61002c63497e628   DIFFERENT
+HEAD:stage-2      2bacd3707fd84c3a84aad120f61002c63497e628
+
+git diff --name-only 0f73ecb HEAD -- stage-2
+  CONTRACT.md  app/store.py  tests/test_stage2_importexport.py
+```
+So every receipt taken at `0f73ecb` — including D6 — was void for the tip once the credential fix and
+the captured/remaining pin landed under `stage-2/`. **All differentials were re-run at the tip's own
+tree**, and the D6 red proof was re-run there too (reverting the four `model_dump` sites on a
+`git archive HEAD:stage-2` copy: **5 failed, 7 passed**). The 7 green are negative controls, and two
+authorization legs are green under the regression only because `authorizations.py` had zero
+`model_dump` at `1f94fcb` too — it was already raw-byte, so the regression cannot reach it.
+
+**Count tree hashes, not commits, when deciding whether a receipt survives.**
 
 **Why it matters beyond tidiness: it is the only artifact in this repository carrying a byte-identical
 commit message to a good tip and completely different content.** That pair is the cleanest available
@@ -283,6 +425,65 @@ git grep -n password_hash fb0b881 -- 'stage-2/tests/test_stage2_*.py'  ->  7 mat
 A grep that returns `NONE` is not evidence that work was not done unless the revision is the tip.
 **Run `git rev-parse --short HEAD` in the same command block as any `git grep`, `git show`, or
 `git ls-files` that is being used to decide whether something exists.**
+
+---
+
+## Identity-token finding — an unstable token standing where an identity was required
+
+Three rulings in this record were written using a token that *looked* like an identifier and was not
+one. In every case the substitution was silent and the resulting text read as legitimate.
+
+| token | what it actually was | what it stood in for |
+| --- | --- | --- |
+| `stash@{0}` | a mutable list index | the commit the stash was taken on (`77b6af7`) |
+| `G1`–`G5` | audit leg-labels | test names |
+| "item 5" | a position in one message | a permanent ruling ID |
+
+The stash index shifts when anything is dropped, so `stash@{0}` names a different object before and
+after a drop. "Item 5" named five different things across five consecutive messages, and both seats
+answered it as though it named one. **A label is not a name.**
+
+**Rules, all now binding:**
+- Anything carrying work gets a **permanent ID** (`G-LEG`, `FRZ-1`, `RUL-14`), quoted forever. Never
+  number a ruling by its position in a message.
+- Never cite a stash by index. Cite the commit.
+- Never write a pass/fail claim in the shape of a citation. **A green claim must name what is green.**
+- A ledger entry that asserts a state must be checkable by a command that a reader can re-run.
+
+## Absence-instrument finding — the most dangerous output shape is an empty one
+
+Four separate instruments in this session failed by reporting absence or emptiness, and **none of
+them announced itself**:
+
+| instrument | reported | reality |
+| --- | --- | --- |
+| raw `bcrypt.hashpw` probe | `401`, read as a defence | can never verify against `_prehash`; false `401` |
+| PowerShell `` `b `` inside a regex | all eight tests **absent** | six existed; `` `b `` is a backspace, not `\b` |
+| PowerShell string compare on two commit messages | misleading empty result | byte-identical, proven later by hash |
+| `git grep -n password_hash <ancestor>` | `NONE` | seven matches at the tip |
+
+An empty result is the one output indistinguishable from a real finding, and **every serious error on
+the planner seat's record came from believing one** — including a security ruling that would have
+shipped as an endorsed control.
+
+**Standing rule: an absence-reporting instrument is untrusted until it has been shown to report a
+thing that is known to exist.** Run it against a positive control first. If it reports nothing, check
+the instrument before checking the claim.
+
+### The sharpest instance: a red proof injected at the obvious line proves nothing.
+An R1 red proof placed at `store.py:1183` — `payload.get("authorizations") or []`, the line that reads
+the payload and the line any reader would choose — **passed with both tests green.** The break was
+written and executed; it just never reached the assertion, because `_install_fixture:707` and
+`_install_full_export:1233` reassign `self.authorizations` twice afterwards. The real injection point
+is `694`.
+
+**A green suite is not evidence that a break was applied.** Confirm the break is live before treating
+the green as a pass. This is the failure mode inverted: the broken instrument produced a *passing*
+result, which is worse than the empty ones above, because nothing about the output looks wrong.
+
+Every red proof in this record therefore names **file, line, and resulting signature**. A red proof
+without an injection point is not a proof, and if you cannot produce a failing signature you have not
+found the live path — you have found a line that reads like one.
 
 ## Counting convention
 
