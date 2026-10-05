@@ -1,3 +1,13 @@
+WITHDRAWN - NOT A GATE - NOT A VERDICT. Core withdrew this V3 result on operator
+directive. This ACCEPT was issued by SipaOsV3, a verifier seat that held no gate
+authority in this room and has been permanently removed by the operator; V3 is
+absent from the participant roster. Retained below as evidence of that removal
+only. It confers no acceptance on any artifact, and commit 48684e8 is not the
+Stage-2 gate. On its face this file also records NO image ID (no sha256: entry),
+so the artifact it purports to judge was never independently identifiable from
+the record.
+
+WITHDRAWN V3 VERDICT - commit 48684e8 (SipaOsV3 verifier): ACCEPT, 2026-10-01
 VERDICT on commit 48684e8 (SipaOsV3 verifier): ACCEPT
 2026-10-01
 

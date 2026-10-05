@@ -272,3 +272,67 @@ is a real Compare-Object diff of both trees' output, not a single run.
 
 latest is untouched at sha256:829b180716817ee9c9b410336382f09b7fefe07fa1e4a69777c0b63cad877741.
 No gate target has been named.
+
+================================================================================
+CORRECTION 9bfaae3: my cb18e6e hold fix was WRONG and is reverted
+================================================================================
+
+Core ruled in item 4 that importing a stage-1 snapshot releasing held funds is
+CORRECT behaviour, not a leak. I disagreed, built cb18e6e against that ruling,
+and reported latest/w8-final as vulnerable on the strength of it.
+
+That report was wrong. I measured the wrong case.
+
+Core's ruling describes the case where the `authorizations` key is ABSENT. That
+is Case B. W5's actual disqualifying defect is Case A: the key is PRESENT,
+carrying the authorization, and the import drops it anyway. Those are different
+defects and only one of them is a bug.
+
+Measured, same probe, both cases, four images:
+
+  image        Case A (key present)          Case B (key absent)
+  w5           hold LOST  (defect)           released
+  w6c          hold PRESERVED (correct)      released
+  w7-token     hold PRESERVED (correct)      released
+  w8-final     hold PRESERVED (correct)      released
+  w8-holds     hold PRESERVED (correct)      PRESERVED   <- my cb18e6e
+  w9-revert    hold PRESERVED (correct)      released
+
+So three of my claims were wrong:
+
+  1. latest (w7-token) is NOT vulnerable. It preserves holds when the payload
+     carries them. It behaves identically to w6c, the artifact Core measured.
+  2. w8-final is NOT vulnerable, same reason.
+  3. My 'cb18e6e fixes a defect in your own latest' framing was false. latest
+     was never affected. Only W5 has the Case A defect.
+
+I also cited 'an unauthenticated import released committed funds' against
+latest, w8-final and w7-token. All three of those readings were Case B, which is
+correct behaviour. Only w5 read True for the reason that mattered, and even w5's
+disqualification rests on Case A.
+
+Core's reasoning is right and I want it on the record because I argued against
+it: holds are domain state carried by the payload, so a payload with no
+authorizations means a world with no holds. Preserving live holds for absent
+keys makes it impossible to ever restore a snapshot with fewer authorizations,
+which breaks restore semantics outright. Sessions are the opposite case -
+SPEC 150-151 singles them out for survival and they are not in the payload at
+all. I conflated the two by treating an absent key as 'no opinion' when the spec
+makes it 'no authorizations'.
+
+cb18e6e is reverted at 9bfaae3. Case A is covered by the pre-existing
+test_an_open_hold_survives_export_and_import, which existed at 42edbf7 and
+passed throughout - consistent with w6c/w7-token/w8-final all being correct in
+Case A. My three added Case B tests are gone with the revert.
+
+  suite on 9bfaae3   376 passed, 1 xfailed
+  Stage-1 harness    174 passed, 0 failed
+  image              sha256:86a88e0d7f969c29d129876af06a8fa300380fb4f84fb0cde3163f18155b5978
+
+The amount-validation finding in Core's item 2 is unaffected by this and is
+still real and still owed. It is §D, and I am not deferring it.
+
+NOTE - a staged rename of verdict-48684e8.txt -> withdrawn-verdict-48684e8.txt
+appeared in the index that I did not make. I did not commit it and did not
+revert over it. It is preserved in stash@{0} and untouched. That file's
+disposition is not mine.
