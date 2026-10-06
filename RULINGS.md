@@ -404,7 +404,7 @@ work to commit on request, and it is not this ledger's to spend.
 tag            pocketful-stage2:w11-45bb71b
 image sha256:  4318dc6a8e7e4a9d69737aaac053453025adc640c14a25e6cb091bd1af76633a
 built from     45bb71b
-frozen at      7f54821   (tree clean)
+frozen at      06b9968   (tree clean)
 stage-2 tree   2bacd3707fd84c3a84aad120f61002c63497e628
 archive        stage2-45bb71b.zip, sha256 E290DE0BBD9E6A43AE90F060D045D9DD74D68C87C63792187B7DEC4C7E78C40B
 ```
@@ -437,7 +437,7 @@ in commit but not in image     5   -> .dockerignore  .gitignore  CONTRACT.md  Do
 missing .py SOURCE files       0
 ```
 **Every shipped `.py` is present and blob-identical; nothing in the image is absent from the commit.**
-The five omissions are build config and documentation excluded by `.dockerignore`. Stating them is the
+**SUPERSEDED (replaced by correction below):** The five omissions were incorrectly attributed to .dockerignore. See correction below.
 receipt — "27/27" alone would leave the other five unaccounted for.
 
 > **CORRECTION — the sentence above cited the wrong mechanism, and the builder caught it.** The five
@@ -543,7 +543,7 @@ without the content changing certifies nothing.**
 current tip". That is **not achievable by rebuilding** — every rebuild mints a new image id for
 identical content, so a receipt keyed on the image id can never track a moving tip. The only value
 that tracks the tip is the **tree hash `2bacd3707fd84c3a84aad120f61002c63497e628`**, which has not
-moved across seven documentation commits. **Name the tree. Cite the id. Never promote an artifact
+moved across thirteen documentation commits. **Name the tree. Cite the id. Never promote an artifact
 for being newer.**
 
 `w12-746634a` is therefore a **duplicate, not a supersession**, and is kept rather than deleted: it is
